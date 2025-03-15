@@ -1,0 +1,13 @@
+name = "AeroInviscid"
+uuid = "d0e1d0b9-f3d5-4fda-b9ae-b2553e6efdf7"
+authors = ["Antonios Gementzopoulos <antoniosgeme@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+AeroGeometry = "f26d28fc-da6c-4213-a731-b5214cb227c7"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
+
+[compat]
+LinearAlgebra = "1.11.0"
+Reexport = "1.2.2"
