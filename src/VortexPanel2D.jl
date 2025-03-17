@@ -1,21 +1,21 @@
-function vortex_panel_solver(airfoil::Airfoil,aoa)
-    x_vort = airfoil.coordinates[1:end,1]
-    y_vort = airfoil.coordinates[1:end,2]
-    x_col = ( x_vort[1:end-1] + x_vort[2:end]) / 2
-    y_col = ( y_vort[1:end-1] + y_vort[2:end]) / 2
-    num_vorts = length(x_vort)
-    num_cols = length(x_col)
+function vortex_panel_solver(airfoil::Airfoil,aoa::Real)
+    xᵥ = airfoil.x
+    yᵥ = airfoil.y
+    xc = ( xᵥ[1:end-1] + xᵥ[2:end]) / 2
+    yc = ( yᵥ[1:end-1] + yᵥ[2:end]) / 2
+    nv = length(xᵥ)
+    nc = nv - 1
 
-    θ = atan.( diff(y_vort) , diff(x_vort) )
+    θ = atan.( diff(yᵥ) , diff(xᵥ) )
     n̂ = [sin.(θ) -cos.(θ)] 
-    uᵧ,vᵧ = induced_velocity_vortex_sheet(x_col,y_col,x_vort,y_vort,ones(size(x_vort)))
+    uᵧ,vᵧ = induced_velocity_vortex_sheet(xc,yc,xᵥ,yᵥ,ones(size(xᵥ)))
 
-    A = zeros(num_cols+1,num_vorts)
+    A = zeros(nc+1,nv)
     A[1:end-1,:] = uᵧ .* n̂[:,1] + vᵧ .* n̂[:,2]
-    A[num_cols+1,1] = 1
-    A[num_cols+1,num_vorts] = 1 
+    A[nc+1,1] = 1
+    A[nc+1,nv] = 1 
 
-    RHS = Vector{typeof(aoa)}(undef,num_vorts)
+    RHS = Vector{Real}(undef,nv)
     RHS[1:end-1] = -( cosd(aoa) .* n̂[:,1] +  sind(aoa)  .* n̂[:,2])
 
     if trailing_edge_thickness(airfoil) < 1e-5
@@ -29,7 +29,7 @@ function vortex_panel_solver(airfoil::Airfoil,aoa)
         RHS[end-1] = 0
     end 
 
-    γ = A\RHS
+    γ = A \ RHS
     return γ
 end 
 
