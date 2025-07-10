@@ -5,7 +5,7 @@ using AeroGeometry
 
 export InviscidProblem, solve, LinearVortex, MultielementAirfoil, 
 induced_velocity, streamlines, element_coordinates, shift_scale_rotate, 
-streamlines_from_grid
+streamlines_from_grid, InviscidSolution
 
 include("Containers.jl")
 

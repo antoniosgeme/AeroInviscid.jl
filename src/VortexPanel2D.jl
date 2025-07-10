@@ -247,44 +247,39 @@ function induced_velocity_te_panel(γₐ,γᵦ,x,y,d,cross_prod,dot_prod)
 end
 
 
+# 1) Scalar dispatch: computes (U, V) at a single point (x, y)
+function induced_velocity(
+    sol::InviscidSolution{A,LinearVortex},
+    x::Real, y::Real,
+) where A<:Airfoil
+    # pull out panels
+    x_sheet, y_sheet = sol.geometry.x, sol.geometry.y
+    γ_sheet          = sol.strength
 
+    # induced from sheet
+    u_vals, v_vals = induced_velocity_vortex_sheet(
+        x, y,
+        x_sheet, y_sheet,
+        γ_sheet
+    )
+    U = sum(u_vals) + cosd(sol.alpha)
+    V = sum(v_vals) + sind(sol.alpha)
 
+    return U, V
+end
 
-
-"""
-    induced_velocity(sol, xs, ys)
-
-Compute the total velocity field on the (xs×ys) grid induced by
-a vortex panel solution `sol` plus the freestream at angle `sol.alpha`.
-
-# Returns
-- `(U, V)`: two `length(xs)×length(ys)` arrays of the x- and y-velocity.
-"""
-function induced_velocity(sol::InviscidSolution{A,LinearVortex}, xs::AbstractVector, ys::AbstractVector) where A <: Airfoil
+# 2) Vector dispatch: just build two matrices by calling the scalar version
+function induced_velocity(
+    sol::InviscidSolution{A,LinearVortex},
+    xs::AbstractVector, ys::AbstractVector,
+) where A<:Airfoil
     Nx, Ny = length(xs), length(ys)
-    U = zeros(Float64, Nx, Ny)
-    V = zeros(Float64, Nx, Ny)
+    U = Array{Float64}(undef, Nx, Ny)
+    V = Array{Float64}(undef, Nx, Ny)
 
-    # panel geometry & strengths
-    
-    x_sheet  = sol.geometry.x
-    y_sheet  = sol.geometry.y
-    γ_sheet  = sol.strength
-
-    # build the field
     for i in 1:Nx, j in 1:Ny
-        u_vals, v_vals = induced_velocity_vortex_sheet(
-            xs[i], ys[j],
-            x_sheet, y_sheet,
-            γ_sheet
-        )
-        U[i, j] = sum(u_vals)
-        V[i, j] = sum(v_vals)
+        U[i,j], V[i,j] = induced_velocity(sol, xs[i], ys[j])
     end
-
-    # add freestream component
-    U .+= cosd(sol.alpha)
-    V .+= sind(sol.alpha)
 
     return U, V
 end
