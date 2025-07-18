@@ -60,7 +60,7 @@ function linear_vortex_solver(airfoil::Airfoil,α::Real)
     RHS = Vector{Real}(undef,Nv)
     RHS[1:end-1] = -( cosd(α) .* n̂[:,1] +  sind(α)  .* n̂[:,2])
 
-    if trailing_edge_thickness(airfoil) < 1e-5
+    if trailing_edge_thickness(airfoil) < 1e-4
         A[end-1,:] .= 0
         A[end-1,1] = 1
         A[end-1,2] = -2

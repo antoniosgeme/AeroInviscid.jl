@@ -2,16 +2,23 @@ using AeroGeometry
 using AeroInviscid
 using Plots
 
-airfoil = Airfoil("NACA0012")
+airfoil = Airfoil("NACA6409")
 
 prob = InviscidProblem(airfoil,14)
 
 sol = solve(prob)
+flowplot(sol)
+
 
 plot(sol)
 
+alphas = 0:1:14
+probs = InviscidProblem.(Ref(airfoil),alphas)
+sols = solve.(probs);
 
-flowplot(sol)
+plot(alphas,[sol.cl for sol in sols])
+plot!(alphas,2π*deg2rad.(alphas),ls=:dash)
+flowplot(sol,clim=(-5,5))
 
 
 x_vec = -1:0.01:1.5
@@ -25,17 +32,22 @@ U,V = induced_velocity(sol,x_vec,y_vec)
 # We'll set compute_dist=false for this example to keep it simple.
 xy = streamlines(x_vec, y_vec, U', V',min_density=2,max_density=5)
 
+
+cp = @. 1 - U^2 - V^2
+contourf!(x_vec,y_vec,cp',lw=0,color=:RdBu,levels=30,clim=(-5, 2))
 plot(xy[:, 1], xy[:, 2],
     title="Evenly Spaced Streamlines of a Vortex Field",
     xlabel="X",
     ylabel="Y",
     legend=false,
     aspect_ratio=:equal,
-    linewidth=1.5,
-    size=(600, 600)
+    linewidth=1.5
 )
 
 plot!(airfoil.x,airfoil.y,seriestype=:shape,fill=:black)
+
+
+
 
 
 xy = streamlines_from_grid(x_vec, y_vec, U', V',density=0.8)

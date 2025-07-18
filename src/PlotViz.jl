@@ -1,6 +1,7 @@
 using LaTeXStrings
 using RecipesBase
 using PlotUtils
+using Interpolations
 
 @recipe function f(sol::InviscidSolution{A,S};
     ) where {A<:Airfoil,S<:LinearVortex}
@@ -84,23 +85,35 @@ end
    
 
     U,V = induced_velocity(sol,xs,ys)
+    Cp = @. 1 - U^2 - V^2
 
     # compute Cp
     Cp = 1 .- (U.^2 .+ V.^2)
     @series begin
         seriestype   := :contourf
-        levels       := 100
+        levels       := 50
         colorbar     := true
         aspect_ratio := :equal
         title        := "Pressure Coefficient Cₚ"
         size         := (600,600)
-        colormap     := :turbo
+        colormap     := :RdBu    
+        lw           := 0 
+        clim         := (-5, 5)
         (
             xs,
             ys,
             Cp'
         )
     end 
+
+    xy = streamlines(xs, ys, U', V',min_density=2,max_density=5)
+
+    @series begin
+        linecolor    := :blue
+        label        := nothing
+        lw           := 1.5
+        (xy[:, 1],xy[:, 2])
+    end        
 
     x_sheet  = sol.geometry.x
     y_sheet  = sol.geometry.y
@@ -110,23 +123,9 @@ end
         fillcolor    := :black
         linecolor    := :black
         aspect_ratio := :equal
+        label        :=nothing
         (x_sheet,y_sheet)
     end
 
-
-        
         
 end 
-
-    #== — second layer: streamline overlay —
-    @series begin
-      seriestype  := :streamplot
-      x           := xs
-      y           := ys
-      u           := U
-      v           := V
-      density     := density
-      color       := :black
-      linewidth   := 1
-    end
-    ==#
