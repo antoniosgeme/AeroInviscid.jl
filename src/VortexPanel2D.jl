@@ -274,11 +274,11 @@ function induced_velocity(
     xs::AbstractVector, ys::AbstractVector,
 ) where A<:Airfoil
     Nx, Ny = length(xs), length(ys)
-    U = Array{Float64}(undef, Nx, Ny)
-    V = Array{Float64}(undef, Nx, Ny)
+    U = Array{Float64}(undef, Ny, Nx)
+    V = Array{Float64}(undef, Ny, Nx)
 
-    for i in 1:Nx, j in 1:Ny
-        U[i,j], V[i,j] = induced_velocity(sol, xs[i], ys[j])
+    for i in 1:Ny, j in 1:Nx
+        U[i,j], V[i,j] = induced_velocity(sol, xs[j], ys[i])
     end
 
     return U, V
@@ -287,8 +287,8 @@ end
 
 function induced_velocity(sol::InviscidSolution{MultielementAirfoil,LinearVortex}, xs::AbstractVector, ys::AbstractVector) 
     Nx, Ny = length(xs), length(ys)
-    U = zeros(Float64, Nx, Ny)
-    V = zeros(Float64, Nx, Ny)
+    U = zeros(Float64, Ny, Nx)
+    V = zeros(Float64, Ny, Nx)
 
     # panel geometry & strengths
     ranges = segment_ranges(sol.geometry)
@@ -304,9 +304,9 @@ function induced_velocity(sol::InviscidSolution{MultielementAirfoil,LinearVortex
         γ_sheet  = sol.strength[rng]
 
         # build the field
-        for i in 1:Nx, j in 1:Ny
+        for i in 1:Ny, j in 1:Nx
             u_vals, v_vals = induced_velocity_vortex_sheet(
-                xs[i], ys[j],
+                xs[j], ys[i],
                 x_sheet, y_sheet, γ_sheet
             )
             U[i, j] += sum(u_vals)

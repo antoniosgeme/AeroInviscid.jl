@@ -74,14 +74,17 @@ end
 @recipe function f(fp::FlowPlot;
                    Nx    = 150,
                    Ny    = 150,
-                   xlim       = (-1.0, 1.5),
-                   ylim       = (-1.0, 1.5),
-                   density    = 1.0) 
+                   xlims = (-1,1.5),
+                   ylims= (-1,1.5),
+                   streams=true,
+                   min_density=2,
+                   max_density=5
+                   ) 
 
     sol = fp.args[end]
-    # build the mesh
-    xs = range(xlim[1], xlim[2], length=Nx)
-    ys = range(ylim[1], ylim[2], length=Ny)
+    # build the meshs
+    xs = range(xlims[1], xlims[2], length=Nx)
+    ys = range(ylims[1], ylims[2], length=Ny)
    
 
     U,V = induced_velocity(sol,xs,ys)
@@ -98,34 +101,56 @@ end
         size         := (600,600)
         colormap     := :RdBu    
         lw           := 0 
-        clim         := (-5, 5)
         (
             xs,
             ys,
-            Cp'
+            Cp
         )
     end 
 
-    xy = streamlines(xs, ys, U', V',min_density=2,max_density=5)
+    if streams
+        xy = streamlines(xs, ys, U, V,min_density=min_density,max_density=max_density)
 
-    @series begin
-        linecolor    := :blue
-        label        := nothing
-        lw           := 1.5
-        (xy[:, 1],xy[:, 2])
-    end        
+        @series begin
+            linecolor    := :black
+            label        := nothing
+            lw           := 1.5
+            (xy[:, 1],xy[:, 2])
+        end       
+    end  
 
-    x_sheet  = sol.geometry.x
-    y_sheet  = sol.geometry.y
+    if typeof(sol.geometry) <: MultielementAirfoil
+        for (i,airfoil) in enumerate(sol.geometry.airfoils)
+            xy_vort = shift_scale_rotate.(airfoil.x,airfoil.y,
+                                        sol.geometry.le_loc[i][1],sol.geometry.le_loc[i][2],
+                                        sol.geometry.pitch[i],sol.geometry.chord[i]) 
+            x_sheet  = [xy[1] for xy in xy_vort]
+            y_sheet  = [xy[2] for xy in xy_vort]
+    
+            @series begin
+                seriestype := :shape
+                fillcolor    := :black
+                linecolor    := :black
+                aspect_ratio := :equal
+                label        :=nothing
+                (x_sheet,y_sheet)
+            end
+        end 
 
-    @series begin
-        seriestype := :shape
-        fillcolor    := :black
-        linecolor    := :black
-        aspect_ratio := :equal
-        label        :=nothing
-        (x_sheet,y_sheet)
-    end
+    else typeof(sol.geometry) <: Airfoil
+        x_sheet  = sol.geometry.x
+        y_sheet  = sol.geometry.y
+
+        @series begin
+            seriestype := :shape
+            fillcolor    := :black
+            linecolor    := :black
+            aspect_ratio := :equal
+            label        :=nothing
+            (x_sheet,y_sheet)
+        end
+
+end 
 
         
 end 
