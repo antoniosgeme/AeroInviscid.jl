@@ -68,7 +68,6 @@ end
     end 
 end
 
-
 @userplot FlowPlot
 
 @recipe function f(fp::FlowPlot;
@@ -86,7 +85,6 @@ end
     xs = range(xlims[1], xlims[2], length=Nx)
     ys = range(ylims[1], ylims[2], length=Ny)
    
-
     U,V = induced_velocity(sol,xs,ys)
     Cp = @. 1 - U^2 - V^2
 

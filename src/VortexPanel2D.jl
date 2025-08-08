@@ -2,10 +2,9 @@ function solve(prob::InviscidProblem{A,LinearVortex}) where A<:Airfoil
     airfoil = prob.geometry
     α       = prob.alpha
 
-    γ  = linear_vortex_solver(airfoil, α)       # Vector of vortex strengths
-    cp = @. 1 - γ^2                             # @. adds the dots ⇒ 1 .- γ .^ 2
+    γ  = linear_vortex_solver(airfoil, α)       
+    cp = @. 1 - γ^2                             
 
-    # crude thin-airfoil estimate: CL = 2∫γ dx
     d = hypot.(diff(airfoil.x),diff(airfoil.y))
     cl = 2 * sum((γ[1:end-1] + γ[2:end])/2 .* d)
 
@@ -15,22 +14,18 @@ end
 function solve(prob::InviscidProblem{MultielementAirfoil,LinearVortex})
     multielement = prob.geometry
 
-    # big concatenated gamma, one block per element
     γ  = linear_vortex_solver(multielement, prob.alpha)
-    cp = @. 1 - γ^2   # pressure coefficient
+    cp = @. 1 - γ^2   
 
     cl = 0.0
     offset = 1
     for airfoil in multielement.airfoils
         Nv = length(airfoil.x)
 
-        # pull out the γ’s for *this* airfoil
         γ_seg = γ[offset:offset+Nv-1]
 
-        # element-local panel lengths
         d = hypot.(diff(airfoil.x), diff(airfoil.y))
 
-        # 2 * ∑ (γᵢ + γᵢ₊₁)/2 * Δsᵢ
         cl += 2 * sum(((γ_seg[1:end-1] .+ γ_seg[2:end]) ./ 2) .* d)
 
         offset += Nv
@@ -40,7 +35,7 @@ function solve(prob::InviscidProblem{MultielementAirfoil,LinearVortex})
 end
 
 
-function linear_vortex_solver(airfoil::Airfoil,α::Real)
+function linear_vortex_solver(airfoil::Airfoil,α::T) where T<:Real
     xᵥ = airfoil.x
     yᵥ = airfoil.y
     xc = ( xᵥ[1:end-1] + xᵥ[2:end]) / 2
@@ -57,7 +52,7 @@ function linear_vortex_solver(airfoil::Airfoil,α::Real)
     A[Nc+1,1] = 1
     A[Nc+1,Nv] = 1 
 
-    RHS = Vector{Real}(undef,Nv)
+    RHS = Vector{T}(undef,Nv)
     RHS[1:end-1] = -( cosd(α) .* n̂[:,1] +  sind(α)  .* n̂[:,2])
 
     if trailing_edge_thickness(airfoil) < 1e-4
@@ -144,11 +139,6 @@ function linear_vortex_solver(multielement::MultielementAirfoil,α::Real)
         end 
     end 
     γ = A\RHS
-
-    #x = [x_vort[start_vort_idx[i]:end_vort_idx[i]] for i = 1:num_airfoils]
-    #y = [y_vort[start_vort_idx[i]:end_vort_idx[i]] for i = 1:num_airfoils]
-    #γ = [γ[start_vort_idx[i]:end_vort_idx[i]] for i = 1:num_airfoils]
-
     return γ
 end 
 
@@ -161,7 +151,10 @@ and strength γ. The sheet is discretized by linear vorticity panels. The ends o
 are connected by a constant stength source/vorticty panel. This is done to make sure the flow 
 leaves each end tangentially 
 """ 
-function induced_velocity_vortex_sheet(x,y,xᵧ,yᵧ,γ)
+function induced_velocity_vortex_sheet(x,y,xᵧ::AbstractVector{T}, yᵧ::AbstractVector{T},
+    γ::AbstractVector{T}) where T<:Real
+    @assert length(x) == length(y) "x and y must have the same length"
+    @assert length(xᵧ) == length(yᵧ) "xᵧ and yᵧ must have the same length"
     Nv = length(xᵧ)
     Nc = length(x)
     θ = atan.( diff(yᵧ) , diff(xᵧ) );
@@ -247,83 +240,90 @@ function induced_velocity_te_panel(γₐ,γᵦ,x,y,d,cross_prod,dot_prod)
 end
 
 
-# 1) Scalar dispatch: computes (U, V) at a single point (x, y)
+function induced_velocity(
+    sol::I,
+    x::T, y::T,
+) where {I<:InviscidSolution, T<:Real}
+    
+    U1, V1 = induced_velocity(sol, [x], [y])
+    return U1[1], V1[1]
+end
+
 function induced_velocity(
     sol::InviscidSolution{A,LinearVortex},
-    x::Real, y::Real,
-) where A<:Airfoil
-    # pull out panels
-    x_sheet, y_sheet = sol.geometry.x, sol.geometry.y
-    γ_sheet          = sol.strength
+    X::AbstractArray{T}, Y::AbstractArray{T},
+) where {A<:Airfoil,T<:Real}
+    
+    shp = size(X)
 
-    # induced from sheet
+    x_sheet, y_sheet = sol.geometry.x, sol.geometry.y
+    γ_sheet = sol.strength
+
+    xpts = vec(X)    
+    ypts = vec(Y)
+
     u_vals, v_vals = induced_velocity_vortex_sheet(
-        x, y,
-        x_sheet, y_sheet,
-        γ_sheet
-    )
-    U = sum(u_vals) + cosd(sol.alpha)
-    V = sum(v_vals) + sind(sol.alpha)
+        xpts, ypts, x_sheet, y_sheet, γ_sheet)
+
+    u = sum(u_vals,dims=2) .+ cosd(sol.alpha)
+    v = sum(v_vals,dims=2) .+ sind(sol.alpha)
+
+    U = reshape(u, shp)
+    V = reshape(v, shp)
 
     return U, V
 end
 
-# 2) Vector dispatch: just build two matrices by calling the scalar version
 function induced_velocity(
-    sol::InviscidSolution{A,LinearVortex},
-    xs::AbstractVector, ys::AbstractVector,
-) where A<:Airfoil
-    Nx, Ny = length(xs), length(ys)
-    U = Array{Float64}(undef, Ny, Nx)
-    V = Array{Float64}(undef, Ny, Nx)
+    sol::InviscidSolution{MultielementAirfoil,LinearVortex},
+    X::AbstractArray{T}, Y::AbstractArray{T},
+) where T<:Real
 
-    for i in 1:Ny, j in 1:Nx
-        U[i,j], V[i,j] = induced_velocity(sol, xs[j], ys[i])
+    shp = size(X)
+    U = zeros(Float64, shp)
+    V = zeros(Float64, shp)
+
+    # flatten grid
+    xpts = vec(X)
+    ypts = vec(Y)
+
+    # for each element of the multielement
+    ranges = segment_ranges(sol.geometry)
+    for (n, airfoil) in enumerate(sol.geometry.airfoils)
+        rng       = ranges[n]
+        γ_sheet   = sol.strength[rng]
+
+        xy_vort = shift_scale_rotate.(airfoil.x, airfoil.y,
+                                      sol.geometry.le_loc[n][1],
+                                      sol.geometry.le_loc[n][2],
+                                      sol.geometry.pitch[n],
+                                      sol.geometry.chord[n])
+        x_sheet = getindex.(xy_vort, 1)
+        y_sheet = getindex.(xy_vort, 2)
+
+        u_vals, v_vals = induced_velocity_vortex_sheet(
+            xpts, ypts,
+            x_sheet, y_sheet,
+            γ_sheet
+        )
+
+        u_contrib = vec(sum(u_vals, dims=2))
+        v_contrib = vec(sum(v_vals, dims=2))
+
+        U .+= reshape(u_contrib, shp)
+        V .+= reshape(v_contrib, shp)
     end
 
-    return U, V
-end
-
-
-function induced_velocity(sol::InviscidSolution{MultielementAirfoil,LinearVortex}, xs::AbstractVector, ys::AbstractVector) 
-    Nx, Ny = length(xs), length(ys)
-    U = zeros(Float64, Ny, Nx)
-    V = zeros(Float64, Ny, Nx)
-
-    # panel geometry & strengths
-    ranges = segment_ranges(sol.geometry)
-    for (n,airfoil) in enumerate(sol.geometry.airfoils)
-        rng = ranges[n]
-        
-        xy_vort = shift_scale_rotate.(airfoil.x,airfoil.y,
-                                        sol.geometry.le_loc[n][1],sol.geometry.le_loc[n][2],
-                                        sol.geometry.pitch[n],sol.geometry.chord[n]) 
-
-        x_sheet  = [xy[1] for xy in xy_vort]
-        y_sheet  = [xy[2] for xy in xy_vort]
-        γ_sheet  = sol.strength[rng]
-
-        # build the field
-        for i in 1:Ny, j in 1:Nx
-            u_vals, v_vals = induced_velocity_vortex_sheet(
-                xs[j], ys[i],
-                x_sheet, y_sheet, γ_sheet
-            )
-            U[i, j] += sum(u_vals)
-            V[i, j] += sum(v_vals)
-        end
-
-    end 
-
-    # add freestream component
     U .+= cosd(sol.alpha)
     V .+= sind(sol.alpha)
 
     return U, V
 end
 
+
 function segment_ranges(multielement::MultielementAirfoil)
     offset = 1
+    println(offset)
     lengths = [length(airfoil.x) for airfoil in multielement.airfoils]
     ends = offset .+ cumsum(lengths) .- 1
     starts = offset .+ [0; cumsum(lengths[1:end-1])]

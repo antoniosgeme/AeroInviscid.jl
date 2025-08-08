@@ -9,14 +9,9 @@ streamlines_from_grid, InviscidSolution
 
 include("Containers.jl")
 
-
 include("Tools.jl")
 
 include("VortexPanel2D.jl")
-
-
-include("Streamlines.jl")
-using .Streamlines
 
 include("PlotViz.jl")
 

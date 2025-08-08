@@ -275,3 +275,4 @@ sstag,sstag_g,i1, i2,xstag, sgnue, xi = stagpoint_find(sol,wake)
 t, hTE, dtdx, tcp, tdp = TE_info(airfoil)
 
 wgap = wake_gap(sol,wake,xi)
+

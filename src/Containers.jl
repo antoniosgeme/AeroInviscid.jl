@@ -28,7 +28,7 @@ InviscidProblem(geom::G,α) where G<:Geometry =
 # ────────────────────────────────────────────────
 struct InviscidSolution{G<:Geometry,S<:FlowSingularity} <: FlowSolution
     geometry    :: G
-    alpha       :: Real
+    alpha       :: Float64
     strength    :: Vector{Float64}
     cp          :: Vector{Float64}
     cl          :: Float64
