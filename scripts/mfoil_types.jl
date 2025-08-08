@@ -161,6 +161,8 @@ end
     wake  :: Bool  = false
     turb  :: Bool  = false
     simi  :: Bool  = false
+
+    is     :: Int      = 0
 end
 
 # ---------------------------------------------------------------------------

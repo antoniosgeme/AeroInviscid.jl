@@ -1,9 +1,7 @@
 using AeroGeometry
 using LinearAlgebra
-using Printf: Format, format
-
-
-
+using Printf
+using Printf: format, Format
 
 
 include("mfoil_types.jl")
@@ -22,7 +20,7 @@ end
 
 function init_M(alpha::Real=0.0)
     # Build Mfoil
-    snaca = "2412"
+    snaca = "0012"
     foil = Airfoil("NACA"*snaca)
     M = Mfoil()
     # set geometry name
@@ -53,7 +51,7 @@ function init_M(alpha::Real=0.0)
     M.oper.Vinf = 1.0
     M.oper.alpha = alpha
     M.oper.rho   = 1.0
-    M.oper.Re    = 1e5
+    M.oper.Re    = 1e6
     M.oper.Ma    = 0.0
     M.oper.viscous = false   # inviscid default
     M.oper.givencl = false
@@ -349,20 +347,7 @@ function station_param(M::Mfoil, p::Param, i::Int)
 end
 
 
-function get_uk(u, param::Param)
-    if param.Minf > 0
-        ℓ    = param.KTl
-        Vinf = param.Vinf
-        den   = 1 .- ℓ .* (u ./ Vinf).^2
-        den_u = -2 .* ℓ .* u ./ (Vinf^2)
-        uk    = (1 - ℓ) .* u ./ den
-        uk_u  = (1 - ℓ) ./ den .- (uk ./ den) .* den_u
-        return uk, uk_u
-    else
-        # incompressible: no correction
-        return u, one.(u)
-    end
-end
+
 
 # ---------------------------
 # Utility: upwind weighting
@@ -390,9 +375,9 @@ function get_upw(U1::AbstractVector{<:Real}, U2::AbstractVector{<:Real}, param)
     return upw, upw_U
 end
 
-function upwind(upw::Real, upw_U::AbstractVector{<:Real},
-                f1::Real, f1_U1::AbstractVector{<:Real},
-                f2::Real, f2_U2::AbstractVector{<:Real})
+function upwind(upw, upw_U,
+                f1, f1_U1,
+                f2, f2_U2)
     f   = (1-upw)*f1 + upw*f2
     # derivative layout [d/dU1, d/dU2] (8 entries total for 4+4)
     f_U = (-upw_U).*f1 .+ upw_U.*f2 .+ vcat((1-upw).*f1_U1, upw.*f2_U2)
@@ -1150,9 +1135,19 @@ function solve_inviscid!(M)
     M.glob.conv = true
 end
 
+function signed_area(X)
+    N = size(X,2)
+    s = 0.0
+    for i in 1:N
+        j = i == N ? 1 : i+1
+        s += X[1,i]*X[2,j] - X[1,j]*X[2,i]
+    end
+    return 0.5*s
+end
+
 function sanity_inviscid(M)
     airfoil = Airfoil("NACA2412")
-    prob = InviscidProblem(airfoil, 0)
+    prob = InviscidProblem(airfoil, M.oper.alpha)
     sol = solve(prob)
     @assert !isempty(M.isol.gam) "No inviscid solution stored"
     γ = M.isol.gam
@@ -1167,7 +1162,1729 @@ function sanity_inviscid(M)
     return nothing
 end
 
-M = init_M(5)
+"""
+    space_geom(dx0, L, Np) -> Vector{Float64}
+
+Geometrically spaces `Np` points on [0, L], where the first interval is `dx0`.
+Returns a vector `[x₀, x₁, …, x_{Np-1}]` with `x₀=0` and `x_{end}=L`.
+"""
+function space_geom(dx0::Real, L::Real, Np::Integer)
+    @assert Np > 1 "Need at least two points for spacing."
+    N = Np - 1
+    N == 1 && return Float64[0.0, float(L)]
+
+    d = L / dx0
+    # Initial guess for r using the same cubic-based idea as the MATLAB code
+    a = N*(N-1)*(N-2)/6
+    b = N*(N-1)/2
+    c = N - d
+    r = 1.0
+    if a != 0
+        disc = max(b*b - 4*a*c, 0.0)
+        r = 1 + (-b + sqrt(disc)) / (2a)
+    else
+        # Fallback for small N where a==0 (N ≤ 2)
+        if N > 1
+            r = 1 + 2*(d - N)/(N*(N - 1))  # linearized sum guess near r≈1
+            if !isfinite(r) || r <= 0
+                r = 1.0
+            end
+        end
+    end
+
+    # Newton iterations to solve: r^N - 1 = d*(r - 1)
+    for _ in 1:20
+        R  = r^N - 1 - d*(r - 1)
+        Rp = N*r^(N-1) - d
+        if Rp == 0
+            break
+        end
+        dr = -R / Rp
+        r += dr
+        if abs(dr) < 1e-12
+            break
+        end
+    end
+    if !isfinite(r) || r <= 0
+        r = 1.0  # fallback to uniform if Newton went weird
+    end
+
+    x = zeros(Float64, Np)
+    x[1] = 0.0
+    if abs(r - 1) < 1e-12
+        # uniform spacing
+        dx = L / N
+        @inbounds for i in 2:Np
+            x[i] = (i - 1) * dx
+        end
+    else
+        # geometric spacing: Δx_k = dx0 * r^(k-1)
+        s = 0.0
+        @inbounds for k in 1:N
+            s += dx0 * r^(k - 1)
+            x[k + 1] = s
+        end
+        x[end] = float(L)  # enforce exact endpoint
+    end
+
+    return x
+end
+
+
+function panel_linvortex_velocity(
+    Xj::AbstractMatrix{<:Real},
+    xi::AbstractVector{<:Real},
+    vdir::Union{Nothing,AbstractVector{<:Real}} = nothing,
+    onmid::Bool = false,
+)
+    @assert size(Xj,1) == 2 && size(Xj,2) == 2 "Xj must be 2×2"
+    @assert length(xi) == 2 "xi must be length-2"
+    if vdir !== nothing
+        @assert length(vdir) == 2 "vdir must be length-2"
+    end
+
+    # panel endpoints
+    xj1, zj1 = Xj[1,1], Xj[2,1]
+    xj2, zj2 = Xj[1,2], Xj[2,2]
+
+    # tangent/normal (panel-aligned basis)
+    tx, tz = xj2 - xj1, zj2 - zj1
+    d = hypot(tx, tz)
+    @assert d > 0 "panel has zero length"
+    tx, tz = tx/d, tz/d
+    nx, nz = -tz, tx
+
+    # control point in panel-aligned coordinates
+    xrel, zrel = xi[1] - xj1, xi[2] - zj1
+    x = xrel*tx + zrel*tz       # along-tangent
+    z = xrel*nx + zrel*nz       # along-normal
+
+    # distances/angles
+    r1 = hypot(x, z)            # from left edge
+    r2 = hypot(x - d, z)        # from right edge
+    θ1 = atan(z, x)             # atan2(z, x)
+    θ2 = atan(z, x - d)
+
+    # velocity in panel frame due to unit end strengths
+    if onmid
+        ug1 = 1/2 - 1/4;  ug2 = 1/4
+        wg1 = -1/(2π);    wg2 = 1/(2π)
+    else
+        temp1 = (θ2 - θ1) / (2π)
+        temp2 = (2*z*log(r1/r2) - 2*x*(θ2 - θ1)) / (4π*d)
+        ug1 =  temp1 + temp2
+        ug2 =       - temp2
+
+        temp1 =  log(r2/r1) / (2π)
+        temp2 = (x*log(r1/r2) - d + z*(θ2 - θ1)) / (2π*d)
+        wg1 =  temp1 + temp2
+        wg2 =       - temp2
+    end
+
+    # rotate back to global (x,z)
+    ax, az = ug1*tx + wg1*nx, ug1*tz + wg1*nz
+    bx, bz = ug2*tx + wg2*nx, ug2*tz + wg2*nz
+
+    if vdir === nothing
+        return (Float64[ax, az], Float64[bx, bz])
+    else
+        return (ax*vdir[1] + az*vdir[2],
+                bx*vdir[1] + bz*vdir[2])
+    end
+end
+
+function panel_constsource_velocity(
+    Xj::AbstractMatrix{<:Real},
+    xi::AbstractVector{<:Real},
+    vdir::Union{Nothing,AbstractVector{<:Real}} = nothing,
+)
+    @assert size(Xj,1) == 2 && size(Xj,2) == 2 "Xj must be 2×2"
+    @assert length(xi) == 2 "xi must be length-2"
+    if vdir !== nothing
+        @assert length(vdir) == 2 "vdir must be length-2"
+    end
+
+    # panel endpoints
+    xj1, zj1 = Xj[1,1], Xj[2,1]
+    xj2, zj2 = Xj[1,2], Xj[2,2]
+
+    # tangent/normal (panel-aligned basis)
+    tx, tz = xj2 - xj1, zj2 - zj1
+    d = hypot(tx, tz)
+    @assert d > 0 "panel has zero length"
+    tx, tz = tx/d, tz/d
+    nx, nz = -tz, tx
+
+    # control point in panel-aligned coordinates
+    xrel, zrel = xi[1] - xj1, xi[2] - zj1
+    x = xrel*tx + zrel*tz       # along-tangent
+    z = xrel*nx + zrel*nz       # along-normal
+
+    # distances/angles
+    r1 = hypot(x, z)            # from left edge
+    r2 = hypot(x - d, z)        # from right edge
+    θ1 = atan(z, x)
+    θ2 = atan(z, x - d)
+
+    # tiny-distance guards (mirror MATLAB behavior)
+    ep = 1e-9
+    if r1 < ep
+        logr1 = 0.0
+        θ1 = π
+        θ2 = π
+    else
+        logr1 = log(r1)
+    end
+    if r2 < ep
+        logr2 = 0.0
+        θ1 = 0.0
+        θ2 = 0.0
+    else
+        logr2 = log(r2)
+    end
+
+    # velocity in panel frame
+    u = (0.5/π) * (logr1 - logr2)
+    w = (0.5/π) * (θ2 - θ1)
+
+    # rotate back to global
+    ax = u*tx + w*nx
+    az = u*tz + w*nz
+
+    if vdir === nothing
+        return Float64[ax, az]
+    else
+        return ax*vdir[1] + az*vdir[2]
+    end
+end
+
+
+function inviscid_velocity(
+    X::AbstractMatrix{<:Real},
+    G::AbstractVector{<:Real},
+    Vinf::Real,
+    alpha::Real,
+    x::AbstractVector{<:Real};
+    return_jacobian::Bool = false,
+)
+    @assert size(X,1) == 2 "X must be 2×N (rows: x,z; cols: nodes)"
+    @assert length(G) == size(X,2) "G must have one value per node (length N)"
+    @assert length(x) == 2 "x must be a 2-vector"
+
+    N = size(X,2)
+    V   = zeros(Float64, 2)
+    V_G = return_jacobian ? zeros(Float64, 2, N) : nothing
+
+    # TE info
+    _, _, _, tcp, tdp = TE_info(X)
+
+    # panel contributions (airfoil panels 1..N-1)
+    for j in 1:(N-1)
+        a, b = panel_linvortex_velocity(X[:, [j, j+1]], x, nothing, false)
+        # accumulate velocity
+        @inbounds V .+= a .* G[j] .+ b .* G[j+1]
+        if return_jacobian
+            @inbounds V_G[:, j]   .+= a
+            @inbounds V_G[:, j+1] .+= b
+        end
+    end
+
+    # TE source panel (between node N -> 1)
+    a = panel_constsource_velocity(X[:, [N, 1]], x, nothing)
+    f1 = a .* (-0.5*tcp)
+    f2 = a .* ( 0.5*tcp)
+    @inbounds V .+= f1 .* G[1] .+ f2 .* G[N]
+    if return_jacobian
+        @inbounds V_G[:, 1] .+= f1
+        @inbounds V_G[:, N] .+= f2
+    end
+
+    # TE vortex panel (between node N -> 1)
+    aV, bV = panel_linvortex_velocity(X[:, [N, 1]], x, nothing, false)
+    f1 = (aV .+ bV) .* ( 0.5*tdp)
+    f2 = (aV .+ bV) .* (-0.5*tdp)
+    @inbounds V .+= f1 .* G[1] .+ f2 .* G[N]
+    if return_jacobian
+        @inbounds V_G[:, 1] .+= f1
+        @inbounds V_G[:, N] .+= f2
+    end
+
+    # freestream contribution
+    cα = cos(alpha * π / 180)
+    sα = sin(alpha * π / 180)
+    V .+= Vinf .* [cα, sα]
+
+    return return_jacobian ? (V, V_G) : V
+end
+
+function build_wake!(M)
+    @assert !isempty(M.isol.gam) "No inviscid solution"
+
+    N    = M.foil.N
+    Vinf = M.oper.Vinf
+
+    # Number of wake points (same heuristic as MATLAB)
+    Nw = ceil(Int, N/10 + 10*M.geom.wakelen)
+
+    # Ensure we have foil arclengths S
+    S = M.foil.s
+    if length(S) != N
+        # fallback: compute cumulative arclength along foil nodes
+        S = zeros(Float64, N)
+        for i in 2:N
+            S[i] = S[i-1] + norm(M.foil.x[:, i] .- M.foil.x[:, i-1])
+        end
+    end
+
+    # first nominal wake panel size (average of first & last airfoil panel)
+    ds1 = 0.5 * ((S[2]-S[1]) + (S[end]-S[end-1]))
+
+    # geometrically spaced distances along wake (0..L_wake)
+    sv = space_geom(ds1, M.geom.wakelen * M.geom.chord, Nw)  # length Nw
+
+    xyw = zeros(Float64, 2, Nw)  # wake points
+    tw  = similar(xyw)           # wake tangents
+
+    # TE midpoint & wake initial direction
+    xy1 = M.foil.x[:, 1]
+    xyN = M.foil.x[:, N]
+    xyte = 0.5 .* (xy1 .+ xyN)
+    n = xyN .- xy1
+    t = [n[2]; -n[1]]                 # tangent leaving TE toward +x if CCW
+    @assert t[1] > 0 "Wrong wake direction; ensure airfoil points are CCW"
+
+    # first wake point—nudge just behind TE
+    xyw[:, 1] = xyte .+ 1e-5 * M.geom.chord .* (t / norm(t))
+
+    # s-values for wake are continuation of foil s
+    sw = S[end] .+ sv
+
+    # March the wake with predictor–corrector
+    for i in 1:(Nw-1)
+        # predictor
+        v1 = inviscid_velocity(M.foil.x, M.isol.gam, Vinf, M.oper.alpha, xyw[:, i])
+        v1 ./= norm(v1);   tw[:, i] = v1
+        xyw[:, i+1] = xyw[:, i] .+ (sv[i+1] - sv[i]) .* v1
+
+        # corrector
+        v2 = inviscid_velocity(M.foil.x, M.isol.gam, Vinf, M.oper.alpha, xyw[:, i+1])
+        v2 ./= norm(v2);   tw[:, i+1] = v2
+        xyw[:, i+1] = xyw[:, i] .+ (sv[i+1] - sv[i]) .* 0.5 .* (v1 .+ v2)
+    end
+
+    # Inviscid UE along wake and reference (0°, 90°)
+    uewi     = zeros(Float64, Nw)
+    uewiref  = zeros(Float64, Nw, 2)
+    for i in 1:Nw
+        v = inviscid_velocity(M.foil.x, M.isol.gam,            Vinf, M.oper.alpha, xyw[:, i]);  uewi[i]      = dot(v, tw[:, i])
+        v = inviscid_velocity(M.foil.x, M.isol.gamref[:, 1],   Vinf, 0.0,          xyw[:, i]);  uewiref[i,1] = dot(v, tw[:, i])
+        v = inviscid_velocity(M.foil.x, M.isol.gamref[:, 2],   Vinf, 90.0,         xyw[:, i]);  uewiref[i,2] = dot(v, tw[:, i])
+    end
+
+    # Write back to M
+    M.wake.N = Nw
+    M.wake.x = xyw
+    M.wake.s = sw
+    M.wake.t = tw
+    M.isol.uewi    = uewi
+    M.isol.uewiref = uewiref
+
+    return nothing
+end
+
+
+function stagpoint_find!(M)
+    @assert !isempty(M.isol.gam) "No inviscid solution"
+
+    N = M.foil.N
+    γ = M.isol.gam
+    S = M.foil.s
+
+    # first index where gamma > 0 (upper surface region for CW ordering)
+    J = findall(g -> g > 0, γ)
+    @assert !isempty(J) "no stagnation point"
+    j  = first(J)
+    i1 = (j == 1) ? N : j - 1
+    i2 = j
+
+    G = (γ[i1], γ[i2])
+    Ss = (S[i1], S[i2])
+    den = G[2] - G[1]
+    @assert abs(den) > eps() "degenerate gamma difference at stagnation"
+
+    # linear interpolation weights in s using zero crossing of gamma
+    w1 = G[2] / den
+    w2 = -G[1] / den
+    sst = w1*Ss[1] + w2*Ss[2]
+
+    # stash indices and s location
+    M.isol.Istag  = (i1, i2)
+    M.isol.sstag  = sst
+
+    # x-location (linear blend of the two neighboring nodes)
+    xstag_vec = M.foil.x[:, [i1, i2]] * [w1; w2]
+    M.isol.xstag = (xstag_vec[1], xstag_vec[2])
+
+    # derivative of sstag w.r.t. the two gammas
+    st_g1 = G[2] * (Ss[1] - Ss[2]) / (den^2)
+    M.isol.sstag_g = (st_g1, -st_g1)
+
+    # sign convention for ue on airfoil nodes
+    sgnue = fill(-1, N)
+    for k in J
+        sgnue[k] = 1
+    end
+    M.isol.sgnue = sgnue
+
+    # distance-from-stagnation coordinate (airfoil + wake continuation)
+    xi_air  = abs.(S .- sst)
+    xi_wake = (M.wake.N > 0) ? (M.wake.s .- sst) : Float64[]
+    M.isol.xi = vcat(xi_air, xi_wake)
+
+    return nothing
+end
+
+function identify_surfaces!(M)
+    @assert M.isol.Istag != (0, 0) "Stagnation point not set. Call `stagpoint_find!` first."
+
+    iL, iU = M.isol.Istag
+    N  = M.foil.N
+    Nw = M.wake.N
+
+    Is_lower = collect(iL:-1:1)
+    Is_upper = collect(iU:N)
+    Is_wake  = Nw > 0 ? collect(N+1:N+Nw) : Int[]
+
+    M.vsol.Is = [Is_lower, Is_upper, Is_wake]
+    return nothing
+end
+
+function set_wake_gap!(M)
+    # TE geometry info
+    _, hTE, dtdx, _, _ = TE_info(M.foil.x)
+
+    # clip TE thickness slope
+    flen = 2.5
+    dtdx = clamp(dtdx, -3.0/flen, 3.0/flen)
+    Lw = flen * hTE
+
+    Nw = M.wake.N
+    wgap = zeros(Float64, Nw)
+
+    # nothing to do if no wake or no TE gap
+    if Nw == 0 || abs(Lw) <= eps(Float64)
+        M.vsol.wgap = wgap
+        return nothing
+    end
+
+    # xi distances (airfoil then wake); TE is at index M.foil.N
+    ξ = M.isol.xi
+    iTE = M.foil.N
+
+    for i in 1:Nw
+        xib = (ξ[iTE + i] - ξ[iTE]) / Lw
+        if xib <= 1.0
+            wgap[i] = hTE * (1 + (2 + flen*dtdx)*xib) * (1 - xib)^2
+        else
+            wgap[i] = 0.0
+        end
+    end
+
+    M.vsol.wgap = wgap
+    return nothing
+end
+
+function calc_ue_m!(M)
+    @assert !isempty(M.isol.gam) "No inviscid solution"
+    N  = M.foil.N
+    Nw = M.wake.N
+    @assert Nw > 0 "No wake has been constructed"
+
+    # -------------------------
+    # Cgam = d(ue_wake)/d(gamma)  [Nw × N]
+    # -------------------------
+    Cgam = zeros(Float64, Nw, N)
+    for i in 1:Nw
+        # sensitivities of induced velocity at wake point i
+        _, V_G = inviscid_velocity(M.foil.x, M.isol.gam, 0.0, 0.0, M.wake.x[:, i]; return_jacobian=true)
+        ti = M.wake.t[:, i]
+        # project the 2D velocity sensitivity onto the local tangent
+        Cgam[i, :] = V_G[1, :].*ti[1] .+ V_G[2, :].*ti[2]
+    end
+
+    # ----------------------------------------------
+    # B = d(psi_surface)/d(source)  [(N+1) × (N+Nw-2)]
+    # (airfoil panels: constant source; wake: piecewise-linear)
+    # ----------------------------------------------
+    nsrc = N + Nw - 2  # number of panels (N-1 airfoil + Nw-1 wake)
+    B = zeros(Float64, N+1, nsrc)
+
+    for i in 1:N
+        xi = M.foil.x[:, i]
+
+        # airfoil panels (constant source)
+        for j in 1:N-1
+            B[i, j] = panel_constsource_stream(M.foil.x[:, [j, j+1]], xi)
+        end
+
+        # wake panels (two-piece linear source per panel)
+        for j in 1:Nw-1
+            # build "left / mid / right" points for wake panel j
+            Xj = M.wake.x[:, [j, j+1]]
+            Xm = 0.5 .* (Xj[:, 1] .+ Xj[:, 2])
+            X3 = similar(M.wake.x, 2, 3)
+            X3[:, 1] = Xj[:, 1]   # left
+            X3[:, 2] = Xm         # mid
+            X3[:, 3] = Xj[:, 2]   # right
+            if j == Nw-1
+                # ghost extension for the last right half
+                X3[:, 3] .= 2 .* X3[:, 3] .- X3[:, 2]
+            end
+
+            # left half (linear)
+            a, b = panel_linsource_stream(X3[:, [1, 2]], xi)
+            if j > 1
+                B[i, N-1 + j    ] += 0.5*a + b
+                B[i, N-1 + j - 1] += 0.5*a
+            else
+                B[i, N-1 + j    ] += b
+            end
+
+            # right half (linear)
+            a, b = panel_linsource_stream(X3[:, [2, 3]], xi)
+            B[i, N-1 + j] += a + 0.5*b
+            if j < Nw-1
+                B[i, N-1 + j + 1] += 0.5*b
+            else
+                B[i, N-1 + j]    += 0.5*b
+            end
+        end
+    end
+
+    # ----------------------------------------------
+    # Bp = -AIC^{-1} * B  =>  d(gamma)/d(source)  [N × nsrc]
+    # (last row of the solve is the surface psi DOF—drop it)
+    # ----------------------------------------------
+    Bp_full = -(M.isol.AIC \ B)
+    Bp = Bp_full[1:end-1, :]
+
+    # ----------------------------------------------
+    # Csig = d(ue_wake)/d(source)  [Nw × nsrc]
+    # ----------------------------------------------
+    Csig = zeros(Float64, Nw, nsrc)
+
+    for i in 1:Nw
+        xi = M.wake.x[:, i]
+        ti = M.wake.t[:, i]
+
+        # airfoil panels: avoid the two panels that meet at TE for i=1
+        jstart = (i == 1) ? 2 : 1
+        jend   = (i == 1) ? (N-2) : (N-1)
+        for j in jstart:jend
+            Csig[i, j] = panel_constsource_velocity(M.foil.x[:, [j, j+1]], xi, ti)
+        end
+
+        # wake panels: piecewise linear (split into halves around each wake node)
+        for j in 1:Nw
+            I1 = max(j-1, 1)
+            I2 = j
+            I3 = min(j+1, Nw)
+            Xj = M.wake.x[:, [I1, I2, I3]]
+            # convert to (left-midpoint, node, right-midpoint)
+            Xj[:, 1] .= 0.5 .* (Xj[:, 1] .+ Xj[:, 2])
+            Xj[:, 3] .= 0.5 .* (Xj[:, 2] .+ Xj[:, 3])
+            if j == Nw
+                # ghost extension on last
+                Xj[:, 3] .= 2 .* Xj[:, 2] .- Xj[:, 1]
+            end
+
+            d1 = hypot(Xj[1,2]-Xj[1,1], Xj[2,2]-Xj[2,1])
+            d2 = hypot(Xj[1,3]-Xj[1,2], Xj[2,3]-Xj[2,2])
+
+            if i == j
+                # singular/self terms: use the closed-form limits
+                if j == 1
+                    dl = norm(M.foil.x[:, 2] .- M.foil.x[:, 1])     # lower surface panel length
+                    du = norm(M.foil.x[:, N] .- M.foil.x[:, N-1])   # upper surface panel length
+                    Csig[i, 1      ] += (0.5/π) * (log(dl/d2) + 1.0)
+                    Csig[i, N-1    ] += (0.5/π) * (log(du/d2) + 1.0)
+                    Csig[i, N-1 + 1] += -(0.5/π)
+                elseif j == Nw
+                    # last point has no self-effect (ghost extension)
+                    Csig[i, N-1 + j - 1] += 0.0
+                else
+                    aa = (0.25/π) * log(d1/d2)
+                    Csig[i, N-1 + j - 1] += aa + 0.5/π
+                    Csig[i, N-1 + j    ] += aa - 0.5/π
+                end
+            else
+                # regular off-diagonal wake contributions
+                if j == 1
+                    a, b = panel_linsource_velocity(Xj[:, [2, 3]], xi, ti)
+                    Csig[i, N-1 + 1] += b             # right half of first wake panel
+                    Csig[i, 1      ] += a             # lower airfoil panel
+                    Csig[i, N-1    ] += a             # upper airfoil panel
+                elseif j == Nw
+                    a = panel_constsource_velocity(Xj[:, [1, 3]], xi, ti) # ghost full panel
+                    Csig[i, N + Nw - 2] += a
+                else
+                    a1, b1 = panel_linsource_velocity(Xj[:, [1, 2]], xi, ti) # left half
+                    a2, b2 = panel_linsource_velocity(Xj[:, [2, 3]], xi, ti) # right half
+                    Csig[i, N-1 + j - 1] += a1 + 0.5*b1
+                    Csig[i, N-1 + j    ] += 0.5*a2 + b2
+                end
+            end
+        end
+    end
+
+    # ----------------------------------------------
+    # Combine to get ue_sigma at airfoil+wake nodes
+    # Dw = d(ue_wake)/d(source) = Cgam*Bp + Csig
+    # enforce ue continuity at first wake node
+    # ----------------------------------------------
+    Dw = Cgam * Bp + Csig
+    Dw[1, :] .= Bp[end, :]
+
+    M.vsol.ue_sigma = vcat(Bp, Dw)
+
+    # Use sgnue to convert signed ue_sigma → unsigned ue_m, and set sigma_m.
+    # (We’ll implement this next in `rebuild_ue_m!`.)
+    rebuild_ue_m!(M)
+
+    return nothing
+end
+
+function rebuild_ue_m!(M::MfoilTypes.Mfoil)
+    @assert size(M.vsol.ue_sigma, 1) > 0 "Need ue_sigma to build ue_m"
+
+    N  = M.foil.N
+    Nw = M.wake.N
+
+    # Dp = d(source)/d(mass)  [(N+Nw-2) x (N+Nw)]
+    Dp = zeros(Float64, N + Nw - 2, N + Nw)
+
+    # Airfoil constant-source panels: rows 1..(N-1)
+    for i in 1:(N-1)
+        ds = M.foil.s[i+1] - M.foil.s[i]
+        @assert ds != 0.0 "Zero panel spacing on foil (s[i+1] == s[i])"
+        # elementwise multiply by ±1 sign on each endpoint
+        Dp[i, i]   =  M.isol.sgnue[i]   * (-1.0 / ds)
+        Dp[i, i+1] =  M.isol.sgnue[i+1] * ( 1.0 / ds)
+    end
+
+    # Wake two-piece-linear sources: rows N..(N+Nw-2)
+    for i in 1:max(Nw-1, 0)
+        ds = M.wake.s[i+1] - M.wake.s[i]
+        @assert ds != 0.0 "Zero panel spacing in wake (s[i+1] == s[i])"
+        row = (N - 1) + i
+        Dp[row, N + i]     = -1.0 / ds
+        Dp[row, N + i + 1] =  1.0 / ds
+    end
+
+    M.vsol.sigma_m = Dp
+
+    # sign of ue at all points (airfoil sign pattern + +1 on wake)
+    sgue = vcat(Float64.(M.isol.sgnue), ones(Float64, Nw))        # (N+Nw)
+    sgue_col = reshape(sgue, :, 1)                                # (N+Nw)×1
+
+    # ue_m = diag(sgue) * ue_sigma * sigma_m
+    # Do the left diag-mult via broadcasting instead of building a diagonal matrix
+    UEscaled = M.vsol.ue_sigma .* sgue_col                        # (N+Nw)×(N+Nw-2)
+    M.vsol.ue_m = UEscaled * M.vsol.sigma_m                       # (N+Nw)×(N+Nw)
+
+    return nothing
+end
+
+function panel_linsource_stream(Xj::AbstractMatrix{<:Real},
+                                xi::AbstractVector{<:Real})
+    # panel endpoints
+    xj1, zj1 = Xj[1,1], Xj[2,1]
+    xj2, zj2 = Xj[1,2], Xj[2,2]
+
+    # panel-aligned basis
+    t = [xj2 - xj1, zj2 - zj1]
+    d = sqrt(t[1]^2 + t[2]^2)
+    t ./= d
+    n = [-t[2], t[1]]
+
+    # control point in panel coords
+    xz = [xi[1] - xj1, xi[2] - zj1]
+    x  = xz[1]*t[1] + xz[2]*t[2]
+    z  = xz[1]*n[1] + xz[2]*n[2]
+
+    # distances & angles
+    r1 = hypot(x, z)
+    r2 = hypot(x - d, z)
+    θ1 = atan(z, x)
+    θ2 = atan(z, x - d)
+
+    # branch cut at θ=0
+    if θ1 < 0; θ1 += 2π; end
+    if θ2 < 0; θ2 += 2π; end
+
+    # near-singularity handling
+    ep = 1e-9
+    if r1 < ep
+        logr1 = 0.0
+        θ1 = π; θ2 = π
+    else
+        logr1 = log(r1)
+    end
+    if r2 < ep
+        logr2 = 0.0
+        θ1 = 0.0; θ2 = 0.0
+    else
+        logr2 = log(r2)
+    end
+
+    # streamfunction pieces
+    P1 = (0.5/π) * ( x*(θ1 - θ2) + θ2*d + z*logr1 - z*logr2 )
+    P2 = x*P1 + (0.5/π) * ( 0.5*r2^2*θ2 - 0.5*r1^2*θ1 - 0.5*z*d )
+
+    # influence coeffs for endpoint source strengths (s1,s2)
+    a = P1 - P2/d
+    b = P2/d
+    return a, b
+end
+
+# Linear source panel — velocity influence (a,b)
+# If vdir === nothing -> return 2-vectors; else return scalars dotted with vdir
+function panel_linsource_velocity(Xj::AbstractMatrix{<:Real},
+                                  xi::AbstractVector{<:Real},
+                                  vdir::Union{AbstractVector{<:Real},Nothing})
+    # panel endpoints
+    xj1, zj1 = Xj[1,1], Xj[2,1]
+    xj2, zj2 = Xj[1,2], Xj[2,2]
+
+    # panel-aligned basis
+    t = [xj2 - xj1, zj2 - zj1]
+    d = sqrt(t[1]^2 + t[2]^2)
+    t ./= d
+    n = [-t[2], t[1]]
+
+    # control point in panel coords
+    xz = [xi[1] - xj1, xi[2] - zj1]
+    x  = xz[1]*t[1] + xz[2]*t[2]
+    z  = xz[1]*n[1] + xz[2]*n[2]
+
+    # distances & angles
+    r1 = hypot(x, z)
+    r2 = hypot(x - d, z)
+    θ1 = atan(z, x)
+    θ2 = atan(z, x - d)
+
+    # velocity components in panel coords (per endpoint source)
+    tmp1 = log(r1/r2)/(2π)
+    tmp2 = (x*log(r1/r2) - d + z*(θ2 - θ1)) / (2π*d)
+    ug1 =  tmp1 - tmp2
+    ug2 =           tmp2
+
+    tmp1 = (θ2 - θ1)/(2π)
+    tmp2 = (-z*log(r1/r2) + x*(θ2 - θ1)) / (2π*d)
+    wg1 =  tmp1 - tmp2
+    wg2 =           tmp2
+
+    # transform back to global coords
+    a_vec = [ug1*t[1] + wg1*n[1], ug1*t[2] + wg1*n[2]]
+    b_vec = [ug2*t[1] + wg2*n[1], ug2*t[2] + wg2*n[2]]
+
+    if vdir === nothing
+        return a_vec, b_vec
+    else
+        return dot(a_vec, vdir), dot(b_vec, vdir)
+    end
+end
+
+
+function thwaites_init(K::Real, nu::Real)
+    @assert K > 0 "K (stag-point constant) must be positive."
+    th = sqrt(0.45 * nu / (6 * K))  # momentum thickness θ
+    ds = 2.2 * th                    # displacement thickness δ*
+    return th, ds
+end
+
+function residual_station(param, x::AbstractVector{<:Real}, U::AbstractMatrix{<:Real}, Aux::AbstractMatrix{<:Real})
+    # Copy U and remove wake gap from δ* entry for ALL calcs below
+    Uloc = copy(U)
+    Uloc[2, :] .-= Aux[1, :]
+
+    # split states
+    U1 = Uloc[:, 1]
+    U2 = Uloc[:, 2]
+    Um = 0.5 .* (U1 .+ U2)
+
+    th = Uloc[1, :]
+    ds = Uloc[2, :]
+    sa = Uloc[3, :]
+
+    # compressibility-corrected speeds (scalar → scalar derivative)
+    uk1, uk1_u = get_uk(U1[4], param)
+    uk2, uk2_u = get_uk(U2[4], param)
+
+    # logs
+    thlog    = log(th[2] / th[1])
+    thlog_U  = [-1/th[1], 0, 0, 0,  1/th[2], 0, 0, 0]
+
+    uelog    = log(uk2 / uk1)
+    uelog_U  = [0, 0, 0, -uk1_u/uk1,  0, 0, 0, uk2_u/uk2]
+
+    xlog     = log(x[2] / x[1])
+    xlog_x   = [-1/x[1], 1/x[2]]
+
+    dx       = x[2] - x[1]
+    dx_x     = [-1.0, 1.0]
+
+    # upwind factor (scalar and 1×8 derivative)
+    upw, upw_U = get_upw(U1, U2, param)
+
+    # shape parameter H
+    H1, H1_U1 = get_H(Uloc[:, 1])
+    H2, H2_U2 = get_H(Uloc[:, 2])
+    H         = 0.5 * (H1 + H2)
+    H_U       = 0.5 .* vcat(H1_U1, H2_U2)
+
+    # H* (KE shape)
+    Hs1, Hs1_U1 = get_Hs(U1, param)
+    Hs2, Hs2_U2 = get_Hs(U2, param)
+    Hs, Hs_U    = upwind(0.5, 0.0, Hs1, Hs1_U1, Hs2, Hs2_U2)
+
+    # log change in H*
+    Hslog    = log(Hs2 / Hs1)
+    Hslog_U  = vcat((-1/Hs1) .* Hs1_U1, (1/Hs2) .* Hs2_U2)
+
+    # similarity station special case
+    thlog_s    = thlog
+    thlog_U_s  = thlog_U
+    Hslog_s    = Hslog
+    Hslog_U_s  = Hslog_U
+    uelog_s    = uelog
+    uelog_U_s  = uelog_U
+    xlog_s     = xlog
+    xlog_x_s   = xlog_x
+    dx_s       = dx
+    dx_x_s     = dx_x
+
+    if param.simi
+        thlog_s   = 0.0;  thlog_U_s .= 0.0
+        Hslog_s   = 0.0;  Hslog_U_s .= 0.0
+        uelog_s   = 1.0;  uelog_U_s .= 0.0
+        xlog_s    = 1.0;  xlog_x_s   .= 0.0
+        dx_s      = 0.5 * (x[1] + x[2])
+        dx_x_s    = [0.5, 0.5]
+    end
+
+    # wake gap shape Hw
+    Hw1, Hw1_U1 = get_Hw(Uloc[:, 1], Aux[1, 1])
+    Hw2, Hw2_U2 = get_Hw(Uloc[:, 2], Aux[1, 2])
+    Hw          = 0.5 * (Hw1 + Hw2)
+    Hw_U        = 0.5 .* vcat(Hw1_U1, Hw2_U2)
+
+    # shear-lag / amplification equation
+    if param.turb
+        # log change of sqrt(ctau)
+        salog   = log(sa[2] / sa[1])
+        salog_U = [0, 0, -1/sa[1], 0,  0, 0, 1/sa[2], 0]
+
+        # BL thickness measure de (averaged)
+        de1, de1_U1 = get_de(U1, param)
+        de2, de2_U2 = get_de(U2, param)
+        de,  de_U   = upwind(0.5, 0.0, de1, de1_U1, de2, de2_U2)
+
+        # normalized slip velocity Us (averaged)
+        Us1, Us1_U1 = get_Us(U1, param)
+        Us2, Us2_U2 = get_Us(U2, param)
+        Us,  Us_U   = upwind(0.5, 0.0, Us1, Us1_U1, Us2, Us2_U2)
+
+        # Hk (upwinded)
+        Hk1, Hk1_U1 = get_Hk(U1, param)
+        Hk2, Hk2_U2 = get_Hk(U2, param)
+        Hk,  Hk_U   = upwind(upw, upw_U, Hk1, Hk1_U1, Hk2, Hk2_U2)
+
+        # Re_theta (averaged)
+        Ret1, Ret1_U1 = get_Ret(U1, param)
+        Ret2, Ret2_U2 = get_Ret(U2, param)
+        Ret,  Ret_U   = upwind(0.5, 0.0, Ret1, Ret1_U1, Ret2, Ret2_U2)
+
+        # cf (upwinded)
+        cf1, cf1_U1 = get_cf(U1, param)
+        cf2, cf2_U2 = get_cf(U2, param)
+        cf,  cf_U   = upwind(upw, upw_U, cf1, cf1_U1, cf2, cf2_U2)
+
+        # ds averaged (remember: wake-gap already removed)
+        dsa   = 0.5 * (ds[1] + ds[2])
+        dsa_U = 0.5 .* [0,1,0,0,  0,1,0,0]
+
+        # equilibrium (1/ue) due/dx
+        uq, uq_U = get_uq(dsa, dsa_U, cf, cf_U, Hk, Hk_U, Ret, Ret_U, param)
+
+        # cteq (upwinded)
+        cteq1, cteq1_U1 = get_cteq(U1, param)
+        cteq2, cteq2_U2 = get_cteq(U2, param)
+        cteq,  cteq_U   = upwind(upw, upw_U, cteq1, cteq1_U1, cteq2, cteq2_U2)
+
+        # sqrt(ctau) state (upwinded from sa)
+        saa, saa_U = upwind(upw, upw_U, sa[1], [0,0,1,0], sa[2], [0,0,1,0])
+
+        # lag coefficient
+        Klag  = param.SlagK
+        beta  = param.GB
+        Clag  = Klag / beta * 1/(1 + Us)
+        Clag_U = -Clag/(1 + Us) .* Us_U
+
+        # extra dissipation in wake
+        ald = param.wake ? param.Dlr : 1.0
+
+        # shear-lag residual
+        Rlag   = Clag*(cteq - ald*saa) * dx_s - 2*de*salog + 2*de*(uq*dx_s - uelog_s)*param.Cuq
+        Rlag_U = Clag_U*(cteq - ald*saa)*dx_s .+ Clag*(cteq_U .- ald .* saa_U)*dx_s .-
+                 2 .* de_U .* salog .- 2 .* de .* salog_U .+
+                 2 .* de_U .* (uq*dx_s - uelog_s) .* param.Cuq .+ 2 .* de .* (uq_U .* dx_s .- uelog_U_s) .* param.Cuq
+        Rlag_x = Clag*(cteq - ald*saa) .* dx_x_s .+ 2 .* de .* uq .* dx_x_s
+    else
+        # laminar: amplification equation
+        if param.simi
+            Rlag   = sa[1] + sa[2]
+            Rlag_U = [0,0,1,0,  0,0,1,0]
+            Rlag_x = [0.0, 0.0]
+        else
+            damp1, damp1_U1 = get_damp(U1, param)
+            damp2, damp2_U2 = get_damp(U2, param)
+            damp,  damp_U   = upwind(0.5, 0.0, damp1, damp1_U1, damp2, damp2_U2)
+            Rlag   = sa[2] - sa[1] - damp*dx
+            Rlag_U = [0,0,-1,0,  0,0,1,0] .- damp_U .* dx
+            Rlag_x = .-damp .* dx_x
+        end
+    end
+
+    # M^2 (averaged)
+    Ms1, Ms1_U1 = get_Mach2(U1, param)
+    Ms2, Ms2_U2 = get_Mach2(U2, param)
+    Ms,  Ms_U   = upwind(0.5, 0.0, Ms1, Ms1_U1, Ms2, Ms2_U2)
+
+    # cf*x/θ (symm avg with midpoint correction)
+    cfxt1, cfxt1_U1, cfxt1_x1 = get_cfxt(U1, x[1], param)
+    cfxt2, cfxt2_U2, cfxt2_x2 = get_cfxt(U2, x[2], param)
+    cfxtm, cfxtm_Um, cfxtm_xm = get_cfxt(Um, 0.5*(x[1] + x[2]), param)
+
+    cfxt   = 0.25*cfxt1 + 0.5*cfxtm + 0.25*cfxt2
+    cfxt_U = 0.25 .* vcat(cfxt1_U1 .+ cfxtm_Um, cfxtm_Um .+ cfxt2_U2)
+    cfxt_x = 0.25 .* [cfxt1_x1 + cfxtm_xm, cfxtm_xm + cfxt2_x2]
+
+    # momentum residual
+    Rmom   = thlog_s + (2 + H + Hw - Ms) * uelog_s - 0.5 * xlog_s * cfxt
+    Rmom_U = thlog_U_s .+ (H_U .+ Hw_U .- Ms_U) .* uelog_s .+ (2 + H + Hw - Ms) .* uelog_U_s .- 0.5 * xlog_s .* cfxt_U
+    Rmom_x = .-0.5 .* xlog_x_s .* cfxt .- 0.5 .* xlog_s .* cfxt_x
+
+    # cDi*x/θ (upwinded)
+    cDixt1, cDixt1_U1, cDixt1_x1 = get_cDixt(U1, x[1], param)
+    cDixt2, cDixt2_U2, cDixt2_x2 = get_cDixt(U2, x[2], param)
+    cDixt,  cDixt_U               = upwind(upw, upw_U, cDixt1, cDixt1_U1, cDixt2, cDixt2_U2)
+    cDixt_x = [(1 - upw) * cDixt1_x1,  upw * cDixt2_x2]
+
+    # cf*x/θ (upwinded)
+    cfxtu,  cfxtu_U  = upwind(upw, upw_U, cfxt1, cfxt1_U1, cfxt2, cfxt2_U2)
+    cfxtu_x          = [(1 - upw) * cfxt1_x1,  upw * cfxt2_x2]
+
+    # Hss (averaged)
+    Hss1, Hss1_U1 = get_Hss(U1, param)
+    Hss2, Hss2_U2 = get_Hss(U2, param)
+    Hss,  Hss_U   = upwind(0.5, 0.0, Hss1, Hss1_U1, Hss2, Hss2_U2)
+
+    # shape-parameter residual
+    Rshape   = Hslog_s + (2*Hss/Hs + 1 - H - Hw) * uelog_s + xlog_s * (0.5*cfxtu - cDixt)
+    Rshape_U = Hslog_U_s .+ (2 .* Hss_U ./ Hs .- 2 .* Hss ./ (Hs^2) .* Hs_U .- H_U .- Hw_U) .* uelog_s .+
+               (2*Hss/Hs + 1 - H - Hw) .* uelog_U_s .+
+               xlog_s .* (0.5 .* cfxtu_U .- cDixt_U)
+    Rshape_x = xlog_x_s .* (0.5*cfxtu - cDixt) .+ xlog_s .* (0.5 .* cfxtu_x .- cDixt_x)
+
+    # pack outputs with consistent shapes
+    R = [Rmom; Rshape; Rlag]
+
+    # Make each Jacobian row explicitly 1×8, then stack → 3×8
+    R_U = vcat(
+        reshape(Rmom_U,   1, :),
+        reshape(Rshape_U, 1, :),
+        reshape(Rlag_U,   1, :)
+    )
+
+    # Same idea for the x-derivatives: each 1×2, then stack → 3×2
+    R_x = vcat(
+        reshape(Rmom_x,   1, :),
+        reshape(Rshape_x, 1, :),
+        reshape(Rlag_x,   1, :)
+    )
+
+    return R, R_U, R_x
+end
+
+function wake_init(M, ue::Real)
+    # first wake index, and the corresponding current state
+    @assert !isempty(M.vsol.Is[3]) "wake_init: no wake indices found; did you run build_wake/identify_surfaces?"
+    iw = M.vsol.Is[3][1]
+    @assert size(M.glob.U, 1) ≥ 4 "wake_init: M.glob.U must have 4 rows (th, ds, sa, ue)."
+
+    Uw = copy(@view M.glob.U[:, iw])  # 4×1 vector
+
+    # construct the wake system residuals
+    R, _, _ = wake_sys(M, M.param)    # expect R to be a length-3 vector
+    @assert length(R) == 3 "wake_init: wake_sys must return a 3-vector residual R."
+
+    # apply the update: solve the tiny system by a single subtraction, as in MATLAB
+    Uw[1:3] .-= R
+    Uw[4]    =  ue
+
+    return Uw
+end
+
+function wake_sys(M, param)
+    # Indices at the trailing edge (lower and upper) and first wake node
+    il = M.vsol.Is[1][end]    # lower-surface TE index
+    iu = M.vsol.Is[2][end]    # upper-surface TE index
+    iw = M.vsol.Is[3][1]      # first wake index
+
+    Ul = M.glob.U[:, il]      # state at lower TE
+    Uu = M.glob.U[:, iu]      # state at upper TE
+    Uw = M.glob.U[:, iw]      # state at first wake point
+
+    # TE gap
+    _, hTE, _, _, _ = TE_info(M.foil.x)
+
+    # Compute turbulent root shear stress at TE on each side.
+    # If already turbulent, take it directly from the state; otherwise take transition value.
+    # We compute with a *local* param so we don't mutate the caller's struct.
+    p = deepcopy(param)
+    p.turb = true
+    p.wake = false
+
+    if M.vsol.turb[il]
+        ctl     = Ul[3]
+        ctl_Ul  = [0.0, 0.0, 1.0, 0.0]  # d ctl / d Ul
+    else
+        ctl, ctl_Ul = get_cttr(Ul, p)   # 1×4 row derivative
+    end
+
+    if M.vsol.turb[iu]
+        ctu     = Uu[3]
+        ctu_Uu  = [0.0, 0.0, 1.0, 0.0]
+    else
+        ctu, ctu_Uu = get_cttr(Uu, p)
+    end
+
+    # Theta-weighted average for wake shear (root)
+    thsum = Ul[1] + Uu[1]
+    ctw   = (ctl*Ul[1] + ctu*Uu[1]) / thsum
+
+    # Derivatives of ctw wrt Ul and Uu (1×4 rows)
+    # ctw = (ctl*th_l + ctu*th_u) / (th_l + th_u)
+    ctw_Ul = (ctl_Ul .* Ul[1] .+ (ctl - ctw) .* [1.0, 0.0, 0.0, 0.0]) ./ thsum
+    ctw_Uu = (ctu_Uu .* Uu[1] .+ (ctu - ctw) .* [1.0, 0.0, 0.0, 0.0]) ./ thsum
+
+    # Residual (note: delta* in wake includes TE gap hTE)
+    # R = [ th_w - (th_l + th_u);
+    #       ds_w - (ds_l + ds_u + hTE);
+    #       sa_w - ctw ]
+    R = [
+        Uw[1] - (Ul[1] + Uu[1]);
+        Uw[2] - (Ul[2] + Uu[2] + hTE);
+        Uw[3] - ctw
+    ]
+
+    # Jacobians wrt Ul, Uu, Uw -> build 3×4 blocks and then hcat
+    # For Ul block:
+    # rows 1–2 are -I on th, ds; row 3 is -ctw_Ul
+    Ul_block_top = hcat(-Matrix{Float64}(I, 2, 2), zeros(2, 2))    # 2×4
+    R_Ul = vcat(Ul_block_top, -reshape(ctw_Ul, 1, 4))               # 3×4
+
+    # For Uu block:
+    Uu_block_top = hcat(zeros(2, 2), -Matrix{Float64}(I, 2, 2))     # 2×4
+    R_Uu = vcat(Uu_block_top, -reshape(ctw_Uu, 1, 4))               # 3×4
+
+    # For Uw block: eye(3,4) (identity on first three comps, last column zeros)
+    R_Uw = hcat(Matrix{Float64}(I, 3, 3), zeros(3, 1))              # 3×4
+
+    R_U = hcat(R_Ul, R_Uu, R_Uw)
+
+    # Node indices used (lower TE, upper TE, first wake)
+    J = [il, iu, iw]
+
+    return R, R_U, J
+end
+
+function residual_transition(M, param, x::AbstractVector, U::AbstractMatrix, Aux)
+    @assert size(U,1) == 4 && size(U,2) == 2 "U must be 4×2"
+    @assert length(x) == 2 "x must be length-2"
+    @assert hasproperty(param, :is) "param.is (side index 1/2/3) is required."
+
+    # states and handy slices
+    U1 = @view U[:,1]
+    U2 = @view U[:,2]
+    sa = U[3, :]
+    I1 = 1:4
+    I2 = 5:8
+    Z  = zeros(4)
+
+    # forced transition inputs
+    is = getfield(param, :is)
+    forcet = M.oper.forcet[is]
+    xft    = M.oper.xft[is]  * M.geom.chord
+    xift   = M.oper.xift[is]
+
+    # interval quantities
+    x1, x2 = x
+    dx = x2 - x1
+
+    # Find transition location xt (either Newton on amplification or forced)
+    if !forcet
+        xt = x1 + 0.5*dx
+        ncrit = param.ncrit
+        nNewton = 20
+        vprint(param, 3, "  Transition interval = %.5e .. %.5e\n", x1, x2)
+
+        Rxt = 0.0
+        Rxt_xt = 0.0
+        damp1 = 0.0
+        dampt = 0.0
+        dampt_Ut = zeros(4)
+        Ut = similar(U1)
+        Ut_xt = similar(U1)
+
+        for iNewton in 1:nNewton
+            w2 = (xt - x1)/dx
+            w1 = 1 - w2
+            Ut .= w1 .* U1 .+ w2 .* U2
+            Ut_xt .= (U2 .- U1) ./ dx
+            Ut[3] = ncrit
+            Ut_xt[3] = 0.0
+
+            damp1, _damp1_U1 = get_damp(U1, param)
+            dampt, dampt_Ut  = get_damp(Ut,  param)
+            dampt_Ut[3] = 0.0  # amplification state fixed to ncrit at xt
+
+            Rxt     = ncrit - sa[1] - 0.5*(xt - x1)*(damp1 + dampt)
+            Rxt_xt  = -0.5*(damp1 + dampt) - 0.5*(xt - x1) * (dampt_Ut' * Ut_xt)
+
+            dxt = -Rxt / Rxt_xt
+            vprint(param, 4, "   Transition: iNewton=%d, Rxt=%.5e, xt=%.5e\n", iNewton, Rxt, xt)
+
+            dmax = 0.2*dx*(1.1 - iNewton/nNewton)
+            if abs(dxt) > dmax
+                dxt = sign(dxt) * dmax
+            end
+            (abs(Rxt) < 1e-10) && break
+            (iNewton < nNewton) && (xt += dxt)
+        end
+
+        # sensitivities of xt
+        # Rxt_U = -0.5*(xt-x1)*[damp1_U1 + dampt_Ut*w1,  dampt_Ut*w2];  Rxt_U(3) -= 1;
+        _, damp1_U1 = get_damp(U1, param)
+        Rxt_U = -0.5*(xt - x1) .* vcat(damp1_U1 .+ dampt_Ut .* ((dx - (xt - x1))/dx),
+                                       dampt_Ut .* ((xt - x1)/dx))
+        Rxt_U[3] -= 1.0
+
+        Ut_x1 = (U2 .- U1) .* (( (xt - x1)/dx - 1.0) ./ dx)     # (w2-1)/dx
+        Ut_x2 = (U2 .- U1) .* (   (-(xt - x1)/dx) ./ dx)        # (-w2)/dx
+        Ut_x1[3] = 0.0;  Ut_x2[3] = 0.0
+
+        Rxt_x1 =  0.5*(damp1 + dampt) - 0.5*(xt - x1) * (dampt_Ut' * Ut_x1)
+        Rxt_x2 = -0.5*(xt - x1) * (dampt_Ut' * Ut_x2)
+
+        xt_U  = (-1.0 / Rxt_xt) .* Rxt_U
+        xt_U1 = xt_U[I1]
+        xt_U2 = xt_U[I2]
+        xt_x1 = -Rxt_x1 / Rxt_xt
+        xt_x2 = -Rxt_x2 / Rxt_xt
+        M.vsol.xt = xt
+
+    else
+        # forced transition
+        xt = xift
+        w2 = (xt - x1)/dx
+        w1 = 1 - w2
+        Ut = w1 .* U1 .+ w2 .* U2
+        Ut_xt = (U2 .- U1) ./ dx
+
+        Rxt = 0.0; Rxt_xt = 1.0
+        Rxt_x1 = -w1; Rxt_x2 = -w2
+        Rxt_U = zeros(8)
+
+        Ut_x1 = (U2 .- U1) .* (( (xt - x1)/dx - 1.0) ./ dx)
+        Ut_x2 = (U2 .- U1) .* (   (-(xt - x1)/dx) ./ dx)
+
+        xt_U1 = zeros(4); xt_U2 = zeros(4)
+        xt_x1 = -Rxt_x1 / Rxt_xt
+        xt_x2 = -Rxt_x2 / Rxt_xt
+        M.vsol.xt = xt
+    end
+
+    # include d(xt) into ∂Ut/∂x
+    Ut_x1 .= Ut_x1 .+ Ut_xt .* xt_x1
+    Ut_x2 .= Ut_x2 .+ Ut_xt .* xt_x2
+
+    # sensitivities of Ut w.r.t. U1, U2
+    I4 = Matrix{Float64}(I, 4, 4)
+    Ut_U1 = w1 * I4 .+ (U2 .- U1) * (xt_U1' ./ dx)  # 4×4
+    Ut_U2 = w2 * I4 .+ (U2 .- U1) * (xt_U2' ./ dx)  # 4×4
+
+    # laminar/turbulent states at xt
+    Utl     = copy(Ut); Utl_U1 = copy(Ut_U1); Utl_U2 = copy(Ut_U2); Utl_x1 = copy(Ut_x1); Utl_x2 = copy(Ut_x2)
+    if !forcet
+        ncrit = param.ncrit
+        Utl[3] = ncrit
+        Utl_U1[3, :] .= Z
+        Utl_U2[3, :] .= Z
+        Utl_x1[3] = 0.0
+        Utl_x2[3] = 0.0
+    end
+
+    Utt     = copy(Ut); Utt_U1 = copy(Ut_U1); Utt_U2 = copy(Ut_U2); Utt_x1 = copy(Ut_x1); Utt_x2 = copy(Ut_x2)
+
+    # parameter structure (fresh), then set turbulent shear at transition
+    p = build_param(M, 0)
+    p.turb = true
+    cttr, cttr_Ut = get_cttr(Ut, p)
+    Utt[3] = cttr
+    Utt_U1[3, :] = vec(reshape(cttr_Ut, 1, :) * Ut_U1)  # 1×4 * 4×4 -> 1×4
+    Utt_U2[3, :] = vec(reshape(cttr_Ut, 1, :) * Ut_U2)
+    Utt_x1[3]    = dot(cttr_Ut, Utt_x1)
+    Utt_x2[3]    = dot(cttr_Ut, Utt_x2)
+
+    # laminar residual on [x1, xt] with [U1, Utl]
+    p.turb = false
+    Rl, Rl_U, Rl_x = residual_station(p, [x1, xt], hcat(U1, Utl), Aux)
+    Rl_U1  = Rl_U[:, I1]
+    Rl_Utl = Rl_U[:, I2]
+    if forcet
+        Rl[3]           = 0.0
+        Rl_U1[3, :]     .= Z
+        Rl_Utl[3, :]    .= Z
+    end
+
+    # turbulent residual on [xt, x2] with [Utt, U2]
+    p.turb = true
+    Rt, Rt_U, Rt_x = residual_station(p, [xt, x2], hcat(Utt, U2), Aux)
+    Rt_Utt = Rt_U[:, I1]
+    Rt_U2  = Rt_U[:, I2]
+
+    # combine
+    R = Rl + Rt
+    # Jacobians w.r.t U1, U2
+    R_U1 = Rl_U1 + Rl_Utl * Utl_U1 + (Rl_x[:, 2] * xt_U1') + Rt_Utt * Utt_U1 + (Rt_x[:, 1] * xt_U1')
+    R_U2 = Rl_Utl * Utl_U2 + (Rl_x[:, 2] * xt_U2') + Rt_Utt * Utt_U2 + Rt_U2 + (Rt_x[:, 1] * xt_U2')
+    R_U  = hcat(R_U1, R_U2)
+
+    # Jacobians w.r.t x1, x2
+    Rx1 = Rl_x[:, 1] + Rl_x[:, 2]*xt_x1 + Rt_x[:, 1]*xt_x1 + Rl_Utl*Utl_x1 + Rt_Utt*Utt_x1
+    Rx2 = Rt_x[:, 2] + Rl_x[:, 2]*xt_x2 + Rt_x[:, 1]*xt_x2 + Rl_Utl*Utl_x2 + Rt_Utt*Utt_x2
+    R_x = hcat(Rx1, Rx2)
+
+    return R, R_U, R_x
+end
+
+function store_transition!(M, is::Int, i::Int)
+    forcet = M.oper.forcet[is]                 # forced transition flag (Bool)
+    xft    = M.oper.xft[is] * M.geom.chord     # forced transition x location
+
+    # pre/post transition nodes on the airfoil
+    i0 = M.vsol.Is[is][i-1]
+    i1 = M.vsol.Is[is][i]
+    @assert (i0 ≤ M.foil.N) && (i1 ≤ M.foil.N) "Can only store transition on airfoil"
+
+    # xi (s) and x at those nodes
+    xi0, xi1 = M.isol.xi[i0], M.isol.xi[i1]
+    x0,  x1  = M.foil.x[1, i0], M.foil.x[1, i1]
+
+    # xi-location corresponding to a forced *x*-location between nodes
+    xift = xi0 + (xi1 - xi0) * (xft - x0) / (x1 - x0)
+
+    # choose free vs forced transition
+    if (!forcet) || ((M.vsol.xt > 0) && (M.vsol.xt < xift))
+        xt  = M.vsol.xt
+        spre = "free"
+    else
+        xt  = xift
+        # tuples are immutable; replace by making a new tuple
+        M.oper.xift = Base.setindex(M.oper.xift, xt, is)
+        spre = "forced"
+    end
+
+    # warn if out of interval
+    if (xt < xi0) || (xt > xi1)
+        vprint(M.param, 1, "Warning: transition (%.3f) off interval (%.3f, %.3f)!\n", xt, xi0, xi1)
+    end
+
+    # save xi and x locations; rows = side (1=lower,2=upper), cols: (1=xi,2=x)
+    M.vsol.Xt[is, 1] = xt
+    M.vsol.Xt[is, 2] = x0 + (xt - xi0) / (xi1 - xi0) * (x1 - x0)
+
+    slu = ("lower", "upper")
+    vprint(M.param, 1, "  %s transition on %s side at x=%.5f\n", spre, slu[is], M.vsol.Xt[is,2])
+    return nothing
+end
+
+function update_transition!(M)
+    for is in 1:2  # lower/upper surfaces
+        Is = M.vsol.Is[is]
+        N  = length(Is)
+        xft = M.oper.xft[is] * M.geom.chord
+
+        param = build_param(M, is)
+
+        # current last laminar station index (within Is)
+        lam_flags = .! M.vsol.turb[Is]              # true where laminar
+        I = findall(identity, lam_flags)
+        @assert !isempty(I) "No laminar stations found on side $is"
+        ilam0 = I[end]
+
+        # keep current sa (amp/ctau) so we can restore if nothing changes
+        sa_saved = copy(M.glob.U[3, Is])
+
+        # NEW last laminar station (you must implement this function)
+        ilam = march_amplification(M, is)
+
+        # if forcing, set xi of forced transition based on current bracket
+        if M.oper.forcet[is] && ilam < N
+            i0 = Is[ilam]
+            i1 = Is[ilam+1]
+            xi0, xi1 = M.isol.xi[i0], M.isol.xi[i1]
+            x0,  x1  = M.foil.x[1, i0], M.foil.x[1, i1]
+            xift = xi0 + (xi1 - xi0) * (xft - x0) / (x1 - x0)
+            M.oper.xift = Base.setindex(M.oper.xift, xift, is)
+        end
+
+        # no change? restore and continue
+        if ilam == ilam0
+            M.glob.U[3, Is] = sa_saved
+            continue
+        end
+
+        vprint(param, 2, "  Update transition: last lam [%d]->[%d]\n", ilam0, ilam)
+
+        if ilam < ilam0
+            # transition moved earlier: fill turbulent between [ilam+1, ilam0]
+            p = build_param(M, is)
+            p.turb = true
+            p.wake = false
+
+            # shear coefficient at first turb station after transition
+            sa0, _ = get_cttr(M.glob.U[:, Is[ilam+1]], p)
+            # target at the end of the segment, if it exists; otherwise flat
+            sa1 = (ilam0 < N) ? M.glob.U[3, Is[ilam0+1]] : sa0
+
+            xi = M.isol.xi[Is]
+            dx = xi[min(ilam0+1, N)] - xi[ilam+1]
+
+            for k in (ilam+1):ilam0
+                f = (dx == 0 || k == ilam+1) ? 0.0 : (xi[k] - xi[ilam+1]) / dx
+                if (ilam + 1) == ilam0
+                    f = 1.0
+                end
+                M.glob.U[3, Is[k]] = sa0 + f * (sa1 - sa0)
+                @assert M.glob.U[3, Is[k]] > 0.0 "negative ctau in update_transition!"
+                M.vsol.turb[Is[k]] = true
+            end
+
+        elseif ilam > ilam0
+            # transition moved later: mark region as laminar
+            for k in ilam0:ilam
+                M.vsol.turb[Is[k]] = false
+            end
+        end
+    end
+    return nothing
+end
+
+function march_amplification(M, is::Int)
+    # stations on this side
+    Is = M.vsol.Is[is]
+    N  = length(Is)
+
+    # params and local copies
+    param = build_param(M, is)
+    U     = copy(M.glob.U[:, Is])         # 4×N
+    turb  = M.vsol.turb[Is]               # Vector{Bool}
+    xft   = M.oper.xft[is] * M.geom.chord
+
+    # laminar marching setup
+    U[3, 1] = 0.0                         # no amplification at first station
+    param.turb = false
+    param.wake = false
+
+    i = 2
+    while i <= N
+        U1 = view(U, :, i-1)
+        U2 = view(U, :, i)
+
+        # if current station is turbulent, seed amp slightly above previous
+        if turb[i]
+            U2[3] = U1[3] * 1.01
+        end
+
+        dx = M.isol.xi[Is[i]] - M.isol.xi[Is[i-1]]
+
+        # Newton iterations (mostly for the extra amplification term smoothness)
+        nNewton = 20
+        for iNewton in 1:nNewton
+            damp1, damp1_U1 = get_damp(U1, param)
+            damp2, damp2_U2 = get_damp(U2, param)
+            # symmetric average (no upwind); provide zero d(upw)/dU vector
+            damp, damp_U = upwind(0.5, zeros(1,8), damp1, damp1_U1, damp2, damp2_U2)
+
+            Ramp = U2[3] - U1[3] - damp*dx
+
+            if iNewton > 12
+                vprint(param, 3,
+                    "i=%d, iNewton=%d, sa = [%.5e, %.5e], damp = %.5e, Ramp = %.5e\n",
+                    i, iNewton, U1[3], U2[3], damp, Ramp)
+            end
+
+            if abs(Ramp) < 1e-12
+                break
+            end
+
+            # derivative wrt the update variable U2[3] (slot 7 in [U1;U2])
+            Ramp_U = [0,0,-1,0, 0,0,1,0] .- damp_U .* dx
+            dU = -Ramp / Ramp_U[7]
+
+            # small damping/limiter
+            dmax = 0.5 * (1.01 - iNewton/nNewton)
+            ω = abs(dU) > dmax ? dmax/abs(dU) : 1.0
+            U2[3] += ω * dU
+        end
+        if nNewton == 20
+            vprint(param, 1, "march amp Newton unconverged!\n")
+        end
+
+        # check for forced transition crossing in x
+        # (sign change of x - xft across the interval)
+        M.oper.forcet = Base.setindex(M.oper.forcet, false, is)
+        x_left  = M.foil.x[1, Is[i-1]] - xft
+        x_right = M.foil.x[1, Is[i]]   - xft
+        if x_left * x_right < 0.0
+            M.oper.forcet = Base.setindex(M.oper.forcet, true, is)
+            vprint(param, 2, "  forced transition (is,i=%d,%d)\n", is, i)
+            break
+        elseif U2[3] > param.ncrit
+            vprint(param, 2,
+                "  march_amplification (is,i=%d,%d): %.5e is above critical.\n",
+                is, i, U2[3])
+            break
+        else
+            # store amplification back to the global state and local copy
+            M.glob.U[3, Is[i]] = U2[3]
+            U[3, i] = U2[3]
+            @assert isreal(U[3, i]) "imaginary amp during march"
+        end
+
+        i += 1
+    end
+
+    ilam = i - 1
+    return ilam
+end
+
+function init_boundary_layer!(M)
+    # thresholds for separation checks
+    Hmaxl = 3.8   # laminar separation trigger
+    Hmaxt = 2.5   # turbulent separation trigger
+
+    ueinv = get_ueinv(M)                   # inviscid ue at foil (+ wake)
+    M.glob.Nsys = M.foil.N + M.wake.N      # total nodes
+
+    # Reuse existing BL if allowed, but refresh ue
+    if (!M.oper.initbl) && (size(M.glob.U, 2) == M.glob.Nsys)
+        vprint(M.param, 1, "\n <<< Starting with current boundary layer >>> \n")
+        M.glob.U[4, :] .= ueinv
+        return
+    end
+
+    vprint(M.param, 1, "\n <<< Initializing the boundary layer >>> \n")
+
+    # fresh state & flags
+    M.glob.U = zeros(4, M.glob.Nsys)
+    M.vsol.turb = falses(M.glob.Nsys)
+
+    # loop over sides: 1=lower, 2=upper, 3=wake
+    for is in 1:3
+        vprint(M.param, 3, "\nSide is = %d:\n", is)
+
+        Is  = M.vsol.Is[is]               # node indices on this side
+        xi  = M.isol.xi[Is]               # distance from stagnation
+        ue  = ueinv[Is]                   # edge speeds on this side
+        N   = length(Is)
+
+        # x-locations only for foil sides
+        xg = is < 3 ? M.foil.x[1, Is] : similar(xi)  # dummy for wake
+        if is < 3
+            copyto!(xg, M.foil.x[1, Is])
+        end
+
+        # clamp tiny edge speeds
+        uemax = maximum(abs.(ue))
+        ue .= max.(ue, 1e-8 * uemax)
+
+        # parameters & Aux (only wake has nonzero wgap)
+        param = build_param(M, is)
+        Aux   = zeros(1, N)
+        if is == 3
+            Aux[1, :] .= M.vsol.wgap
+        end
+
+        # local state array for this side
+        U = zeros(4, N)
+
+        # forced transition x-location
+        xft = M.oper.xft[is] * M.geom.chord
+
+        # initialize first point
+        i0 = 1
+        if is < 3
+            # Thwaites init near stagnation
+            hitstag = xi[1] < 1e-8 * xi[end]
+            K = hitstag ? ue[2] / xi[2] : ue[1] / xi[1]
+
+            th, ds = thwaites_init(K, M.param.mu0 / M.param.rho0)
+            xst = 1e-6
+            Ust = [th, ds, 0.0, K * xst]
+
+            # Newton to satisfy stagnation (similarity) residual
+            nNewton = 20
+            for iNewton in 1:nNewton
+                param.turb = false
+                param.simi = true
+                R, R_U, _ = residual_station(param, [xst, xst], hcat(Ust, Ust), zeros(1, 2))
+                param.simi = false
+                if norm(R) < 1e-10
+                    break
+                end
+                ID = 1:3
+                A  = R_U[:, ID .+ 4] + R_U[:, ID]  # (∂R/∂U2 + ∂R/∂U1) for th,ds,sa
+                dU = vcat(A \ (-R), 0.0)
+
+                dm = maximum(abs.([dU[1]/Ust[1], dU[2]/Ust[2]]))
+                ω  = dm > 0.2 ? 0.2/dm : 1.0
+                Ust .+= ω .* dU
+            end
+
+            if hitstag
+                U[:, 1] .= Ust
+                U[4, 1] = ue[1]
+                i0 = 2
+            end
+            U[:, i0] .= Ust
+            U[4, i0] = ue[i0]
+        else
+            # wake start from TE using wake system
+            U[:, 1] .= wake_init(M, ue[1])
+            param.turb = true
+            M.vsol.turb[Is[1]] = true
+        end
+
+        # march along the side
+        tran = false
+        i = i0 + 1
+        while i <= N
+            Ip = (i-1):i
+
+            # forced transition detection (foil only)
+            if (!tran) && (!param.turb) && (is < 3)
+                left  = xg[i-1] - xft
+                right = xg[i]   - xft
+                if left * right < 0.0
+                    tran = true
+                    # set forced xi transition location
+                    xift = xi[i-1] + (xi[i] - xi[i-1]) * (xft - xg[i-1]) / (xg[i] - xg[i-1])
+                    M.oper.xift = Base.setindex(M.oper.xift, xift, is)
+                    M.oper.forcet = Base.setindex(M.oper.forcet, true, is)
+                    vprint(param, 1, "forced transition during marching: xft=%.5f, xift=%.5f\n",
+                           xft, xift)
+                end
+            end
+
+            # initial guess: copy previous, set new ue
+            U[:, i] .= U[:, i-1]
+            U[4, i]   = ue[i]
+            if tran
+                ct, _ = get_cttr(U[:, i], param)
+                U[3, i] = ct
+            end
+            M.vsol.turb[Is[i]] = (tran || param.turb)
+
+            direct    = true
+            nNewton   = 30
+            iNswitch  = 12
+            Hktgt     = NaN
+
+            converged = false
+            iNewton_last = 0
+
+            for iNewton in 1:nNewton
+                iNewton_last = iNewton
+                if tran
+                    vprint(param, 4, "i=%d, residual_transition (iNewton = %d)\n", i, iNewton)
+                    R = nothing; R_U = nothing
+                    try
+                        param.is = is
+                        R, R_U, _ = residual_transition(M, param, xi[Ip], U[:, Ip], Aux[:, Ip])
+                    catch
+                        @warn "Transition calculation failed in BL init. Continuing."
+                        M.vsol.xt = 0.5 * (xi[i-1] + xi[i])
+                        U[:, i]   .= U[:, i-1]
+                        U[4, i]    = ue[i]
+                        ct, _ = get_cttr(U[:, i], param)  # ignore gradient
+                        U[3, i]    = ct
+                        R = zeros(3) # so we "converge"
+                    end
+                else
+                    vprint(param, 4, "i=%d, residual_station (iNewton = %d)\n", i, iNewton)
+                    R, R_U, _ = residual_station(param, xi[Ip], U[:, Ip], Aux[:, Ip])
+                end
+
+                if norm(R) < 1e-10
+                    converged = true
+                    break
+                end
+
+                dU = zeros(4)
+                if direct
+                    # solve for th, ds, sa (ue prescribed)
+                    A = R_U[:, 5:7]
+                    dU[1:3] .= A \ (-R)
+                    dU[4] = 0.0 
+                else
+                    # inverse: prescribe Hk target
+                    Hk, Hk_U = get_Hk(U[:, i], param)      # Hk_U is a length-4 Vector
+                    A = vcat(R_U[:, 5:8], (Hk_U[:])')      # 3×4 ; 1×4 -> 4×4
+                    b = vcat(-R, Hktgt - Hk)               # 3 ; 1 -> 4
+                    dU .= A \ b
+                end
+
+                # under-relax
+                dm = maximum(abs.([dU[1]/U[1, i-1], dU[2]/U[2, i-1]]))
+                if !direct
+                    dm = max(dm, abs(dU[4] / max(U[4, i-1], 1e-16)))
+                end
+                if param.turb
+                    dm = max(dm, abs(dU[3] / max(U[3, i-1], 1e-16)))
+                else
+                    dm = max(dm, abs(dU[3] / 10))
+                end
+                ω = dm > 0.3 ? 0.3 / dm : 1.0
+                dU .*= ω
+
+                Ui = U[:, i] .+ dU
+
+                # clip extremes
+                if param.turb
+                    Ui[3] = clamp(Ui[3], 1e-7, 0.3)
+                end
+
+                # check for separation / switch to inverse
+                Hmax = param.turb ? Hmaxt : Hmaxl
+                Hk, _ = get_Hk(Ui, param)
+                if direct && ((Hk > Hmax) || (iNewton > iNswitch))
+                    direct = false
+                    vprint(param, 2, "** switching to inverse: i=%d, iNewton=%d\n", i, iNewton)
+                    Hk_prev, _ = get_Hk(U[:, i-1], param)
+                    Hkr = (xi[i] - xi[i-1]) / U[1, i-1]
+
+                    if param.wake
+                        # implicit relation for wake
+                        H2 = Hk_prev
+                        for _ in 1:6
+                            num = H2 + 0.03 * Hkr * (H2 - 1)^3 - Hk_prev
+                            den = 1 + 0.09 * Hkr * (H2 - 1)^2
+                            H2 -= num / den
+                        end
+                        Hktgt = max(H2, 1.01)
+                    elseif param.turb
+                        Hktgt = Hk_prev - 0.15 * Hkr
+                    else
+                        Hktgt = Hk_prev + 0.03 * Hkr
+                    end
+                    if !param.wake
+                        Hktgt = max(Hktgt, Hmax)
+                    end
+                    if iNewton > iNswitch
+                        U[:, i] .= U[:, i-1]
+                        U[4, i]  = ue[i]
+                    end
+                else
+                    U[:, i] .= Ui
+                end
+            end
+
+            if !converged
+                vprint(param, 1, "** BL init not converged: is=%d, i=%d **\n", is, i)
+                # extrapolate fallback
+                U[:, i] .= U[:, i-1]
+                U[4, i]  = ue[i]
+                if is < 3
+                    rat = xi[i] / xi[i-1]
+                    U[1, i] = U[1, i-1] * sqrt(rat)
+                    U[2, i] = U[2, i-1] * sqrt(rat)
+                else
+                    rlen   = (xi[i] - xi[i-1]) / (10 * U[2, i-1])
+                    U[2, i] = (U[2, i-1] + U[1, i-1] * rlen) / (1 + rlen)
+                end
+            end
+
+            # transition detection (free transition)
+            if (!param.turb) && (!tran) && (U[3, i] > param.ncrit)
+                vprint(param, 2,
+                       "Identified transition at (is=%d, i=%d): n=%.5f, ncrit=%.5f\n",
+                       is, i, U[3, i], param.ncrit)
+                tran = true
+                continue  # redo station with transition model
+            end
+
+            if tran
+                store_transition!(M, is, i)
+                param.turb = true
+                tran = false
+                vprint(param, 2, "storing transition\n")
+            end
+
+            i += 1
+        end
+
+        # save back to global
+        M.glob.U[:, Is] .= U
+    end
+
+    return nothing
+end
+
+function get_cDixt(U, x::Real, param)
+    # cDixt = cDi * x / th
+    cDi, cDi_U = get_cDi(U, param)
+    th = U[1]
+
+    cDixt = cDi * x / th
+    cDixt_U = (x / th) .* cDi_U
+    cDixt_U[1] -= cDixt / th
+    cDixt_x = cDi / th
+
+    return cDixt, cDixt_U, cDixt_x
+end
+
+
+function solve_viscous!(M) 
+
+    enforce_CW_and_TE!(M)
+    solve_inviscid!(M)
+    M.oper.viscous = true
+    init_thermo!(M)
+    build_wake!(M)
+end
+
+M = init_M(2)
 enforce_CW_and_TE!(M)
 solve_inviscid!(M)
-sanity_inviscid(M)
+M.oper.viscous = true
+init_thermo!(M)
+build_wake!(M)
+stagpoint_find!(M)
+identify_surfaces!(M)
+set_wake_gap!(M)
+calc_ue_m!(M)
+init_boundary_layer!(M)
