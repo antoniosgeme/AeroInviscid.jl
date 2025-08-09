@@ -2,6 +2,7 @@ using AeroGeometry
 using LinearAlgebra
 using Printf
 using Printf: format, Format
+using SparseArrays
 
 
 include("mfoil_types.jl")
@@ -2556,7 +2557,7 @@ function march_amplification(M, is::Int)
 
         # check for forced transition crossing in x
         # (sign change of x - xft across the interval)
-        M.oper.forcet = Base.setindex(M.oper.forcet, false, is)
+        M.oper.forcet[is] = false
         x_left  = M.foil.x[1, Is[i-1]] - xft
         x_right = M.foil.x[1, Is[i]]   - xft
         if x_left * x_right < 0.0
@@ -2854,6 +2855,275 @@ function init_boundary_layer!(M)
     return nothing
 end
 
+function stagpoint_move!(M)
+    N  = M.foil.N                           # number of airfoil nodes
+    I  = collect(M.isol.Istag)              # [i_lower, i_upper] (adjacent panel indices)
+    ue = collect(M.glob.U[4, :])            # copy 4th row as a Vector
+    sstag0 = M.isol.sstag
+
+    newpanel = true
+    I1, I2 = I[1], I[2]
+
+    if ue[I2] < 0
+        # move stagnation point up (to larger s), find first positive ue above I2
+        jrel = findfirst(>(0.0), @view ue[I2:end])  # relative index in slice
+        jrel === nothing && error("stagpoint_move!: no positive ue above I2=$I2")
+        I2new = I2 + (jrel - 1)
+        for j in I2:(I2new-1)
+            ue[j] = -ue[j]
+        end
+        I = [I2new-1, I2new]
+    elseif ue[I1] < 0
+        # move stagnation point down (to smaller s), find first positive ue below I1
+        jrel = findfirst(>(0.0), @view ue[I1:-1:1])
+        jrel === nothing && error("stagpoint_move!: no positive ue below I1=$I1")
+        I1new = I1 - (jrel - 1)
+        for j in (I1new+1):I1
+            ue[j] = -ue[j]
+        end
+        I = [I1new, I1new+1]
+    else
+        newpanel = false
+    end
+
+    # move along the (possibly new) panel
+    ues = ue[I]
+    S   = M.foil.s[I]
+    @assert (ues[1] > 0.0 && ues[2] > 0.0) "stagpoint_move!: velocity error at indices $I"
+
+    den = ues[1] + ues[2]
+    w1  = ues[2] / den
+    w2  = ues[1] / den
+
+    M.isol.sstag    = w1*S[1] + w2*S[2]
+    M.isol.xstag = (
+    w1*M.foil.x[1, I[1]] + w2*M.foil.x[1, I[2]],
+    w1*M.foil.x[2, I[1]] + w2*M.foil.x[2, I[2]],
+)
+    k = (S[2] - S[1]) / (den*den)
+    M.isol.sstag_ue = (k*ues[2], -k*ues[1])
+
+    # vprint(M.param, 2, @sprintf("  Moving stagnation point: s=%.15e -> s=%.15e\n", sstag0, M.isol.sstag))
+
+    # refresh xi for all nodes (airfoil then wake)
+    sst = M.isol.sstag
+    M.isol.xi = vcat(abs.(M.foil.s .- sst), M.wake.s .- sst)
+
+    if newpanel
+        # vprint(M.param, 2, @sprintf("  New stagnation panel = %d %d\n", I[1], I[2]))
+        M.isol.Istag = (I[1], I[2])  # update stagnation indices
+        sgnue = ones(eltype(ue), N)
+        sgnue[1:I[1]] .= -1
+        M.isol.sgnue = sgnue
+
+        # Re-identify surfaces, commit ue sign changes near the stag, and rebuild sensitivities
+        identify_surfaces!(M)     # your Julia port’s mutating version
+        M.glob.U[4, :] .= ue
+        rebuild_ue_m!(M)
+    end
+
+    return nothing
+end
+
+function stagnation_state(U::AbstractMatrix{<:Real}, x::AbstractVector{<:Real})
+    @assert size(U,1) == 4 && size(U,2) == 2 "U must be 4×2"
+    @assert length(x) == 2 "x must have length 2"
+
+    U1 = @view U[:, 1]
+    U2 = @view U[:, 2]
+    x1 = float(x[1])
+    x2 = float(x[2])
+
+    dx = x2 - x1
+    # light regularization to avoid singular derivatives
+    if dx == 0.0
+        dx = eps(Float64)
+    end
+    if x1 == 0.0
+        x1 = eps(Float64)
+    end
+
+    dx_x = [-1.0, 1.0]                      # ∂dx/∂[x1,x2]
+
+    rx   = x2 / x1
+    rx_x = [-rx, 1.0] / x1                  # ∂(x2/x1)/∂[x1,x2]
+
+    # linear extrapolation weights for th, ds, sa
+    w1   =  x2 / dx
+    w1_x = (-w1/dx) .* dx_x .+ [0.0, 1.0] / dx
+
+    w2   = -x1 / dx
+    w2_x = (-w2/dx) .* dx_x .+ [-1.0, 0.0] / dx
+
+    Ust = U1 .* w1 .+ U2 .* w2              # 4×1
+
+    # quadratic fit for ue slope near stagnation: ue ≈ K x
+    wk1   =  rx / dx
+    wk1_x =  rx_x ./ dx .- (wk1/dx) .* dx_x
+
+    wk2   = -1.0 / (rx * dx)
+    wk2_x = -wk2 .* (rx_x ./ rx .+ dx_x ./ dx)
+
+    K   = wk1 * U1[4] + wk2 * U2[4]
+    K_U = [0.0, 0.0, 0.0, wk1,  0.0, 0.0, 0.0, wk2]  # 1×8
+    K_x = U1[4] .* wk1_x .+ U2[4] .* wk2_x           # 1×2
+
+    # less-accurate linear option (kept as comments to match MATLAB):
+    # K   = U1[4] / x1
+    # K_U = [0.0, 0.0, 0.0, 1/x1,  0.0, 0.0, 0.0, 0.0]
+    # K_x = [-K/x1, 0.0]
+
+    # small but nonzero stagnation coordinate
+    xst = 1e-6
+    Ust[4] = K * xst
+
+    # Build Ust_U (4×8): top 3 rows are [w1*I₃|0  w2*I₃|0], last row is K_U*xst
+    I34 = zeros(3,4); I34[1,1]=1.0; I34[2,2]=1.0; I34[3,3]=1.0
+    upper = hcat(w1 .* I34, w2 .* I34)                  # 3×8
+    Ust_U = [upper; (K_U .* xst)']                      # 4×8
+
+    # Build Ust_x (4×2): top 3 rows outer-product w.r.t. w1_x, w2_x; last row K_x*xst
+    Ust_x_first3 = U1[1:3] * (w1_x') .+ U2[1:3] * (w2_x')  # 3×2
+    Ust_x = vcat(Ust_x_first3, (K_x .* xst)')              # 4×2
+
+    return Ust, Ust_U, Ust_x, xst
+end
+
+function build_glob_sys!(M)
+    Nsys = M.glob.Nsys
+    M.glob.R   = zeros(Float64, 3*Nsys)
+    M.glob.R_U = spzeros(Float64, 3*Nsys, 4*Nsys)
+    M.glob.R_x = spzeros(Float64, 3*Nsys, Nsys)
+
+    for is in 1:3
+        Is = M.vsol.Is[is]                 # indices on this surface
+        xi = M.isol.xi[Is]                 # distance from LE stagnation
+        N  = length(Is)
+        U  = M.glob.U[:, Is]         # states [th,ds,sa,ue] on this surface
+        Aux = zeros(Float64, 1, N)         # [wgap] row
+
+        if is < 3
+            xg  = M.foil.x[1, Is]          # global x on foil for side is
+        end
+        xft = M.oper.xft[is] * M.geom.chord
+
+        # parameters for this side
+        param = build_param(M, is)
+
+        # set auxiliary data for wake
+        if is == 3
+            Aux[1, :] .= M.vsol.wgap
+        end
+
+        # special case of tiny first xi -> use second point as the "first" station
+        i0 = (is < 3 && xi[1] < 1e-8 * xi[end]) ? 2 : 1
+
+        # ----- first-point system
+        if is < 3
+            # stagnation-based first station (similarity)
+            Ip = (i0):(i0+1)
+            Ust, Ust_U, Ust_x, xst = stagnation_state(U[:, Ip], xi[Ip])
+            param.turb = false
+            param.simi = true
+            xpair  = [xst, xst]                 # 2-element Vector{Float64}
+            Upair  = hcat(Ust, Ust)             # 4×2 matrix, not Vector{Vector}
+            AUpair = Aux[:, [i0, i0]]     # 1×2 matrix
+            R1, R1_Ut, _ = residual_station(param, xpair, Upair, AUpair)
+            param.simi = false
+
+            # collapse the two-station tangent into Ust sensitivities, then to (U1,U2)
+            R1_Ust = @views R1_Ut[:, 1:4] .+ R1_Ut[:, 5:8]   # 3×4
+            R1_U   = R1_Ust * Ust_U                          # 3×8
+            R1_x   = R1_Ust * Ust_x                          # 3×2
+            J      = (Is[i0], Is[i0+1])
+
+            if i0 == 2
+                # i0=1 point landed on stagnation: enforce U1 = Ust on first node
+                vprint(M.param, 2, "hit stagnation!\n")
+                Ig  = (3*Is[1]-2):(3*Is[1])                  # rows for node Is[1]
+                Jg1 = (4*Is[1]-3):(4*Is[1])
+                M.glob.R[Ig] .= U[1:3, 1] .- Ust[1:3]
+                M.glob.R_U[Ig, Jg1] .+= I(3)
+                Jg12 = vcat((4*J[1]-3):(4*J[1]), (4*J[2]-3):(4*J[2]))
+                M.glob.R_U[Ig, Jg12] .-= R1_U[1:3, :]
+                M.glob.R_x[Ig, J[1]] .-= R1_x[1:3, 1]
+                M.glob.R_x[Ig, J[2]] .-= R1_x[1:3, 2]
+            end
+        else
+            # wake initialization at the first wake point
+            R1, R1_U, J = wake_sys(M, param)
+            R1_x = nothing                    # no xi dependence here
+            param.turb = true                 # force turbulent in wake if needed
+            param.wake = true
+        end
+
+        # store first-point system into the global residual/Jacobians
+        Ig = (3*Is[i0]-2):(3*Is[i0])
+        if is < 3
+            M.glob.R[Ig] .= R1
+            # two 4-column blocks, one per station in J
+            M.glob.R_U[Ig, (4*Is[i0]-3):(4*Is[i0])]       .+= R1_U[:, 1:4]
+            M.glob.R_U[Ig, (4*Is[i0+1]-3):(4*Is[i0+1])]   .+= R1_U[:, 5:8]
+            # xi coupling, if available
+            M.glob.R_x[Ig, Is[i0]]     .+= R1_x[:, 1]
+            M.glob.R_x[Ig, Is[i0+1]]   .+= R1_x[:, 2]
+        else
+            M.glob.R[Ig] .= R1
+            # R1_U has three 4-wide blocks: lower TE, upper TE, first wake
+            M.glob.R_U[Ig, (4*J[1]-3):(4*J[1])] .+= R1_U[:, 1:4]
+            M.glob.R_U[Ig, (4*J[2]-3):(4*J[2])] .+= R1_U[:, 5:8]
+            M.glob.R_U[Ig, (4*J[3]-3):(4*J[3])] .+= R1_U[:, 9:12]
+        end
+
+        # ----- march over remaining stations
+        tran = false
+        for i in (i0+1):N
+            Ip = (i-1):i
+
+            # forced transition detection window
+            M.oper.forcet[is] = false
+            if !tran && !param.turb && (is < 3)
+                if (xg[i-1]-xft) * (xg[i]-xft) < 0.0
+                    tran = true
+                    M.oper.xift[is] = xi[i-1] + (xi[i]-xi[i-1]) * (xft - xg[i-1]) / (xg[i] - xg[i-1])
+                    M.oper.forcet[is] = true
+                end
+            end
+
+            # actual transition flag based on current lam/turb node flags
+            tran = xor(M.vsol.turb[Is[i-1]] != 0, M.vsol.turb[Is[i]] != 0)
+
+            # residual/Jacobian at this station pair
+            if tran
+                param.is = is
+                Ri, Ri_U, Ri_x = residual_transition(M, param, xi[Ip], U[:, Ip], Aux[:, Ip])
+                store_transition!(M, is, i)
+            else
+                Ri, Ri_U, Ri_x = residual_station(param, xi[Ip], U[:, Ip], Aux[:, Ip])
+            end
+
+            # accumulate into global structures
+            Ig  = (3*Is[i]-2):(3*Is[i])                     # rows for node i
+            JgL = (4*Is[i-1]-3):(4*Is[i-1])
+            JgR = (4*Is[i]-3):(4*Is[i])
+            M.glob.R[Ig]                .+= Ri
+            M.glob.R_U[Ig, JgL]         .+= Ri_U[:, 1:4]
+            M.glob.R_U[Ig, JgR]         .+= Ri_U[:, 5:8]
+            M.glob.R_x[Ig, Is[i-1]]     .+= Ri_x[:, 1]
+            M.glob.R_x[Ig, Is[i]]       .+= Ri_x[:, 2]
+
+            # once transitioned, all following stations are turbulent
+            if tran
+                param.turb = true
+            end
+        end
+    end
+
+    # (Optional) special stagnation residual treatment could go here.
+    return nothing
+end
+
+
 function get_cDixt(U, x::Real, param)
     # cDixt = cDi * x / th
     cDi, cDi_U = get_cDi(U, param)
@@ -2865,6 +3135,389 @@ function get_cDixt(U, x::Real, param)
     cDixt_x = cDi / th
 
     return cDixt, cDixt_U, cDixt_x
+end
+
+function solve_coupled!(M)
+    # Newton loop
+    nNewton = M.param.niglob
+    M.glob.conv = false
+    vprint(M.param, 1, "\n <<< Beginning coupled solver iterations >>> \n")
+
+    for iNewton in 1:nNewton
+        # assemble global residual/Jacobian for current state
+        build_glob_sys!(M)
+
+        # update forces/post (cl, cm, etc.) for diagnostics and trim
+        calc_force!(M)
+
+        # convergence check on residual
+        Rnorm = norm(M.glob.R, 2)
+        vprint(M.param, 1, @sprintf("\nNewton iteration %d, Rnorm = %.5e\n", iNewton, Rnorm))
+        if Rnorm < M.param.rtol
+            M.glob.conv = true
+            break
+        end
+
+        # solve for state increment (dU, possibly dalpha)
+        solve_glob!(M)
+
+        # apply update with under-relaxation and guardrails
+        update_state!(M)
+
+        # move stagnation point (R_x effects already accounted in Jacobian)
+        stagpoint_move!(M)
+
+        # refresh lam/turb flags and transition bookkeeping
+        update_transition!(M)
+    end
+
+    if !M.glob.conv
+        vprint(M.param, 1, "\n** Global Newton NOT CONVERGED **\n")
+    end
+
+    return nothing
+end
+
+function jacobian_add_Rx!(M)
+    # include effects of R_x into R_U: R_ue += R_x * x_st * st_ue
+    Nsys = M.glob.Nsys
+    Iue  = collect(4:4:4*Nsys)            # ue column indices in the global Jacobian
+
+    # Sensitivity of node x to stagnation location: x_st (length Nsys)
+    sgnue = M.isol.sgnue                   # length N (airfoil)
+    T = eltype(sgnue)
+    Nw = M.wake.N
+    x_st = vcat(-sgnue, -ones(T, Nw))      # wake same sign as upper surface
+
+    # R_st = R_x * x_st  (size: 3Nsys)
+    R_st = M.glob.R_x * x_st
+
+    # Columns to update correspond to ue at the two stag-adjacent nodes
+    Ist    = M.isol.Istag                  # e.g., [i_lower, i_upper]
+    st_ue  = collect(M.isol.sstag_ue)      # ensure a 2-element Vector
+
+    # Rank-1 updates per column to keep it sparse-friendly
+    
+    M.glob.R_U[:, Iue[Ist[1]]] .+= R_st .* st_ue[1]
+    M.glob.R_U[:, Iue[Ist[2]]] .+= R_st .* st_ue[2]
+
+
+    return nothing
+end
+
+function clalpha_residual(M)
+    Nsys  = M.glob.Nsys             # total nodes (airfoil + wake)
+    N     = M.foil.N                # airfoil nodes only
+    α     = M.oper.alpha            # degrees
+
+    if M.oper.givencl
+        # cl constraint residual
+        Rcla = M.post.cl - M.oper.cltgt
+
+        # Jacobian of cl w.r.t. [th,ds,sa,ue]... and extra var alpha at the end
+        Rcla_U = zeros(Float64, 4*Nsys + 1)
+        Rcla_U[end] = M.post.cl_alpha
+        # only ue at AIRFOIL nodes contribute to cl directly
+        for i in 1:N
+            Rcla_U[4*i] = M.post.cl_ue[i]
+        end
+
+        # d/dα of uinv = ueinvref * [cos(α); sin(α)]  (α in deg)
+        # => uinv_α = ueinvref * [-sin(α); cos(α)] * (π/180)
+        θ = α * (pi/180)
+        scale = (pi/180)
+        Ru_alpha = -(get_ueinvref(M) * [-sin(θ); cos(θ)]) * scale  # length Nsys
+
+    else
+        # alpha prescribed: no cl constraint residual, alpha eqn is simply α-α0
+        Rcla = 0.0
+        Ru_alpha = zeros(Float64, Nsys)   # alpha not changing in this mode
+        Rcla_U = zeros(Float64, 4*Nsys + 1)
+        Rcla_U[end] = 1.0                 # residual for fixed-alpha equation
+    end
+
+    return Rcla, Ru_alpha, Rcla_U
+end
+
+function solve_glob!(M)
+    Nsys = M.glob.Nsys
+    docl = M.oper.givencl ? 1 : 0
+
+    # pull ue, ds as plain Vectors and guard ue against 0/negatives
+    ue = collect(M.glob.U[4, :])
+    ds = collect(M.glob.U[2, :])
+    uemax = maximum(abs.(ue))
+    if uemax == 0.0
+        uemax = 1.0
+    end
+    ue = max.(ue, 1e-10 * uemax)
+
+    # inviscid edge velocity
+    ueinv = get_ueinv(M)  # length Nsys
+
+    # global Jacobian (augmented by +1 row/col if cl-constraint is on)
+    R_V = spzeros(Float64, 4*Nsys + docl, 4*Nsys + docl)
+
+    # indices for ds and ue columns in the big state vector
+    Ids = collect(2:4:4*Nsys)
+    Iue = collect(4:4:4*Nsys)
+
+    # include stagnation-location coupling into the ue columns of R_U
+    jacobian_add_Rx!(M)
+
+    # residual: [ primary 3Nsys residuals ; ue-equation residuals ]
+    R = vcat(
+        M.glob.R,
+        ue .- (ueinv .+ M.vsol.ue_m * (ds .* ue))
+    )
+
+    # assemble Jacobian blocks
+    # top-left 3Nsys x 4Nsys block
+    R_V[1:3Nsys, 1:4Nsys] .= M.glob.R_U
+
+    # ue-equation rows
+    rowidx = (3Nsys + 1):(4Nsys)
+    Dds = Diagonal(ds)
+    Due = Diagonal(ue)
+    Isp = spdiagm(0 => ones(Float64, Nsys))
+
+    # d(ue-resid)/d(ue) and d(ue-resid)/d(ds)
+    R_V[rowidx, Iue] .= Isp .- (M.vsol.ue_m * Dds)
+    R_V[rowidx, Ids] .= -(M.vsol.ue_m * Due)
+
+    if docl == 1
+        # cl-constraint residual & Jacobian wrt alpha
+        Rcla, Ru_alpha, Rcla_U = clalpha_residual(M)
+        R = vcat(R, Rcla)
+        R_V[rowidx, 4*Nsys + 1] .= Ru_alpha
+        R_V[4*Nsys + 1, :]      .= Rcla_U
+    end
+
+    # solve the linear system for update
+    dV = -(R_V \ R)
+
+    # stash updates
+    M.glob.dU = reshape(dV[1:4*Nsys], 4, Nsys)
+    if docl == 1
+        M.glob.dalpha = dV[end]
+    end
+
+    return nothing
+end
+
+function rebuild_isol!(M)
+    @assert !isempty(M.isol.gam) "No inviscid solution to rebuild"
+    vprint(M.param, 2, "\n  Rebuilding the inviscid solution.\n")
+
+    α = M.oper.alpha
+    # Combine the 0°/90° reference solutions for the current alpha
+    M.isol.gam = M.isol.gamref * [cosd(α); sind(α)]
+
+    if !M.oper.viscous
+        # In inviscid mode, update stagnation point here
+        stagpoint_find!(M)
+    elseif M.oper.redowake
+        # In viscous mode, optionally rebuild wake + sensitivities if AoA changed
+        build_wake!(M)
+        identify_surfaces!(M)
+        calc_ue_m!(M)   # rebuild matrices due to changed wake geometry
+    end
+
+    return nothing
+end
+
+function update_state!(M)
+    # guard against accidental complex numbers in amp/ctau row
+    if any(!isreal, M.glob.U[3, :])
+        error("imaginary amp in U")
+    end
+    if any(!isreal, M.glob.dU[3, :])
+        error("imaginary amp in dU")
+    end
+
+    # max ctau over turbulent nodes (might be empty)
+    It = findall(M.vsol.turb .!= 0)
+    ctmax = isempty(It) ? 0.0 : maximum(M.glob.U[3, It])
+
+    # start with full step
+    omega = 1.0
+
+    # 1) limit decreases in θ and δ*
+    for k in 1:2
+        Uk  = M.glob.U[k, :]
+        dUk = M.glob.dU[k, :]
+        r   = dUk ./ Uk
+        fmin = minimum(r)                      # most negative ratio
+        om   = (fmin < -0.5) ? abs(0.5 / fmin) : 1.0
+        if om < omega
+            omega = om
+            vprint(M.param, 3, @sprintf("  th/ds decrease: omega = %.5f\n", omega))
+        end
+    end
+
+    # 2) prevent negative amp/ctau after update
+    Uk  = M.glob.U[3, :]
+    dUk = M.glob.dU[3, :]
+    for i in eachindex(Uk)
+        if (!M.vsol.turb[i]) && (Uk[i] < 0.2);           continue; end
+        if ( M.vsol.turb[i]) && (Uk[i] < 0.1*ctmax);      continue; end
+        if (Uk[i] == 0.0) || (dUk[i] == 0.0);            continue; end
+        if Uk[i] + dUk[i] < 0.0
+            om = 0.8 * abs(Uk[i] / dUk[i])
+            if om < omega
+                omega = om
+                vprint(M.param, 3, @sprintf("  neg sa: omega = %.5f\n", omega))
+            end
+        end
+    end
+
+    # 3) prevent big changes in laminar amplification
+    I_lam = findall(.! M.vsol.turb)
+    if any(!isreal, Uk[I_lam])
+        error("imaginary amplification")
+    end
+    dumax = isempty(I_lam) ? 0.0 : maximum(abs.(dUk[I_lam]))
+    om = (dumax > 0) ? abs(2.0 / dumax) : 1.0
+    if om < omega
+        omega = om
+        vprint(M.param, 3, @sprintf("  amp: omega = %.5f\n", omega))
+    end
+
+    # 4) prevent big changes in turbulent cτ
+    I_turb = It
+    dumax = isempty(I_turb) ? 0.0 : maximum(abs.(dUk[I_turb]))
+    om = (dumax > 0) ? abs(0.05 / dumax) : 1.0
+    if om < omega
+        omega = om
+        vprint(M.param, 3, @sprintf("  ctau: omega = %.5f\n", omega))
+    end
+
+    # 5) prevent large ue changes
+    dUe = M.glob.dU[4, :]
+    Vinf = M.oper.Vinf
+    denom = (Vinf == 0.0) ? eps(Float64) : Vinf
+    fmax = maximum(abs.(dUe)) / denom
+    om = (fmax > 0) ? (0.2 / fmax) : 1.0
+    if om < omega
+        omega = om
+        vprint(M.param, 3, @sprintf("  ue: omega = %.5f\n", omega))
+    end
+
+    # 6) prevent large alpha changes
+    dα = getfield(M.glob, :dalpha)   # assumes field exists; else set to 0 upstream
+    if abs(dα) > 2
+        omega = min(omega, abs(2 / dα))
+    end
+
+    # take the update
+    vprint(M.param, 2, @sprintf("  state update: under-relaxation = %.5f\n", omega))
+    @. M.glob.U = M.glob.U + omega * M.glob.dU
+    M.oper.alpha += omega * dα
+
+    # fix bad Hk after the update
+    for is in 1:3
+        Hkmin = (is == 3) ? 1.00005 : 1.02
+        Is = M.vsol.Is[is]
+        param = build_param(M, is)
+        for j in Is
+            Uj = @view M.glob.U[:, j]
+            param = station_param(M, param, j)
+            Hk, _ = get_Hk(Uj, param)
+            if Hk < Hkmin
+                M.glob.U[2, j] += 2 * (Hkmin - Hk) * M.glob.U[1, j]
+            end
+        end
+    end
+
+    # fix negative ctau after the update (only on turbulent nodes)
+    for i in It
+        if M.glob.U[3, i] < 0.0
+            M.glob.U[3, i] = 0.1 * ctmax
+        end
+    end
+
+    # rebuild inviscid solution (γ, wake) if α moved
+    if abs(omega * dα) > 1e-10
+        rebuild_isol!(M)
+    end
+
+    return nothing
+end
+
+function update_transition!(M)
+    # updates: M.vsol.turb flags and M.glob.U[3, :] (amp or √ctau) where needed
+    for is in 1:2  # lower / upper only
+        Is = M.vsol.Is[is]                 # surface node indices
+        N  = length(Is)
+        xft = M.oper.xft[is] * M.geom.chord
+
+        # build per-side params
+        param = build_param(M, is)
+
+        # current last laminar station (local index along Is)
+        lam_mask = M.vsol.turb[Is] .== 0
+        I_lam = findall(lam_mask)
+        ilam0 = isempty(I_lam) ? 1 : I_lam[end]
+
+        # save current amp/ctau row so we can restore if nothing changes
+        sa_saved = copy(@view M.glob.U[3, Is])
+
+        # march amplification to get new last-laminar local index
+        ilam = march_amplification(M, is)
+
+        # if forced transition, set xi value at the forced point
+        if M.oper.forcet[is]
+            i0 = Is[ilam]
+            i1 = Is[min(ilam + 1, N)]
+            xi0, xi1 = M.isol.xi[i0], M.isol.xi[i1]
+            x0,  x1  = M.foil.x[1, i0], M.foil.x[1, i1]
+            denom = (x1 - x0)
+            M.oper.xift[is] = xi0 + (denom == 0 ? 0.0 : (xi1 - xi0) * (xft - x0) / denom)
+        end
+
+        # no change? restore and continue
+        if ilam == ilam0
+            M.glob.U[3, Is] .= sa_saved
+            continue
+        end
+
+        vprint(M.param, 2, @sprintf("  Update transition: last lam [%d]->[%d]\n", ilam0, ilam))
+
+        if ilam < ilam0
+            # transition moved earlier: fill newly turbulent band [ilam+1 : ilam0]
+            param.turb = true
+            # shear stress at transition start
+            sa0 = first(get_cttr( M.glob.U[:, Is[ilam+1]], param))
+            # target at end of band (use existing next-turb value if available)
+            sa1 = (ilam0 < N) ? M.glob.U[3, Is[ilam0+1]] : sa0
+
+            xi = M.isol.xi[Is]
+            dx = xi[min(ilam0+1, N)] - xi[ilam+1]
+
+            for i in (ilam+1):ilam0
+                f = if dx == 0.0 || i == ilam+1
+                    0.0
+                else
+                    (xi[i] - xi[ilam+1]) / dx
+                end
+                if (ilam + 1) == ilam0
+                    f = 1.0
+                end
+                val = sa0 + f * (sa1 - sa0)
+                @assert val > 0.0 "negative ctau in update_transition"
+                M.glob.U[3, Is[i]] = val
+                M.vsol.turb[Is[i]] = 1
+            end
+
+        elseif ilam > ilam0
+            # transition moved later: mark [ilam0 : ilam] laminar; leave values alone
+            for i in ilam0:ilam
+                M.vsol.turb[Is[i]] = 0
+            end
+        end
+    end
+
+    return nothing
 end
 
 
@@ -2888,3 +3541,6 @@ identify_surfaces!(M)
 set_wake_gap!(M)
 calc_ue_m!(M)
 init_boundary_layer!(M)
+stagpoint_move!(M)
+solve_coupled!(M)
+calc_force!(M)

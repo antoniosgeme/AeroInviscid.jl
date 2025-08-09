@@ -53,9 +53,9 @@ end
     redowake:: Bool                       = false  # rebuild wake after α change
     Re      :: Float64                    = 1e5
     Ma      :: Float64                    = 0.0
-    forcet  :: NTuple{3,Bool}             = (false,false,false)
-    xft     :: NTuple{3,Float64}          = (1.0,1.0,1.0)   # forced‑trip x/c
-    xift    :: NTuple{3,Float64}          = (0.0,0.0,0.0)   # forced‑trip ξ
+    forcet  :: Vector{Bool}            = [false,false,false]
+    xft     :: Vector{Float64}          = [1.0,1.0,1.0]   # forced‑trip x/c
+    xift    :: Vector{Float64}           = [0.0,0.0,0.0]   # forced‑trip ξ
 end
 
 # ---------------------------------------------------------------------------
