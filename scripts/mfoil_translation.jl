@@ -52,7 +52,7 @@ function init_M(alpha::Real=0.0)
     M.oper.Vinf = 1.0
     M.oper.alpha = alpha
     M.oper.rho   = 1.0
-    M.oper.Re    = 1e6
+    M.oper.Re    = 1e5
     M.oper.Ma    = 0.0
     M.oper.viscous = false   # inviscid default
     M.oper.givencl = false
@@ -1122,6 +1122,32 @@ function calc_force!(M)
     return nothing
 end 
 
+function cltrim_inviscid!(M)
+    for i in 1:15
+        α = M.oper.alpha
+        calc_force!(M)                          # updates M.post.cl, cl_alpha, cl_ue, etc.
+        R = M.post.cl - M.oper.cltgt
+        if abs(R) < 1e-10
+            break
+        end
+
+        # d/dα of [cosd α; sind α] = [-sind α; cosd α] * π/180
+        sc = [-sind(α); cosd(α)] * (π/180)
+
+        # total derivative: dcl/dα = cl_α + (∂cl/∂ue)^T * (d ue/dα)
+        # ue(α) on the airfoil nodes is (gamref * [cosd α; sind α]) with the same sign
+        # As in your MATLAB, we use M.isol.gamref directly:
+        cl_a = M.post.cl_alpha + dot(M.post.cl_ue, M.isol.gamref * sc)
+
+        dalpha = -R / cl_a
+        M.oper.alpha = α + clamp(dalpha, -2.0, 2.0)
+    end
+
+    # final update of γ(α)
+    M.isol.gam = M.isol.gamref * [cosd(M.oper.alpha); sind(M.oper.alpha)]
+    return nothing
+end
+
 
 function solve_inviscid!(M)
     @assert M.foil.N>0 "No panels"
@@ -1488,7 +1514,7 @@ function build_wake!(M)
     M.wake.s = sw
     M.wake.t = tw
     M.isol.uewi    = uewi
-    M.isol.uewiref = uewiref
+    M.isol.uewiref  = uewiref
 
     return nothing
 end
@@ -2197,8 +2223,8 @@ function wake_sys(M, param)
     R_Ul = vcat(Ul_block_top, -reshape(ctw_Ul, 1, 4))               # 3×4
 
     # For Uu block:
-    Uu_block_top = hcat(zeros(2, 2), -Matrix{Float64}(I, 2, 2))     # 2×4
-    R_Uu = vcat(Uu_block_top, -reshape(ctw_Uu, 1, 4))               # 3×4
+    Uu_block_top = hcat(-Matrix{Float64}(I, 2, 2), zeros(2, 2))  # [-I 0]
+    R_Uu = vcat(Uu_block_top, -reshape(ctw_Uu, 1, 4))
 
     # For Uw block: eye(3,4) (identity on first three comps, last column zeros)
     R_Uw = hcat(Matrix{Float64}(I, 3, 3), zeros(3, 1))              # 3×4
@@ -2524,6 +2550,7 @@ function march_amplification(M, is::Int)
 
         # Newton iterations (mostly for the extra amplification term smoothness)
         nNewton = 20
+        converged = false
         for iNewton in 1:nNewton
             damp1, damp1_U1 = get_damp(U1, param)
             damp2, damp2_U2 = get_damp(U2, param)
@@ -2539,6 +2566,7 @@ function march_amplification(M, is::Int)
             end
 
             if abs(Ramp) < 1e-12
+                converged = true
                 break
             end
 
@@ -2551,7 +2579,7 @@ function march_amplification(M, is::Int)
             ω = abs(dU) > dmax ? dmax/abs(dU) : 1.0
             U2[3] += ω * dU
         end
-        if nNewton == 20
+        if !converged
             vprint(param, 1, "march amp Newton unconverged!\n")
         end
 
@@ -3239,6 +3267,25 @@ function clalpha_residual(M)
     return Rcla, Ru_alpha, Rcla_U
 end
 
+function get_ueinvref(M)
+    @assert !isempty(M.isol.gam) "No inviscid solution"
+
+    N = M.foil.N
+
+    # airfoil: elementwise sign on each row of gamref (N×2)
+    uearef = M.isol.gamref .* reshape(Float64.(M.isol.sgnue), N, 1)
+
+    # wake: use precomputed 0°/90° refs, and enforce continuity if viscous+wake
+    if M.oper.viscous && M.wake.N > 0
+        uewref = copy(M.isol.uewiref)      # (Nw×2)
+        uewref[1, :] .= uearef[end, :]     # continuity at first wake node
+    else
+        uewref = Array{Float64}(undef, 0, 2)
+    end
+
+    return vcat(uearef, uewref)            # (N+Nw)×2
+end
+
 function solve_glob!(M)
     Nsys = M.glob.Nsys
     docl = M.oper.givencl ? 1 : 0
@@ -3520,6 +3567,55 @@ function update_transition!(M)
     return nothing
 end
 
+function get_distributions!(M::MfoilTypes.Mfoil)
+    @assert size(M.glob.U, 2) > 0 "no global solution"
+
+    # pull basics straight from the global state
+    Nsys = M.glob.Nsys
+    M.post.th  = vec(M.glob.U[1, :])             # θ
+    M.post.ds  = vec(M.glob.U[2, :])             # δ*
+    M.post.sa  = vec(M.glob.U[3, :])             # amp or √ctau
+    M.post.uei = get_ueinv(M)                    # inviscid edge speed (airfoil + wake)
+
+    # compressibility-corrected edge speed uk(ue)
+    u_edge = vec(M.glob.U[4, :])
+    ue_corr = similar(u_edge)
+    @inbounds for i in eachindex(u_edge)
+        ue_corr[i], _ = get_uk(u_edge[i], M.param)
+    end
+    M.post.ue = ue_corr
+
+    # derived viscous quantities (free-stream based cf, Ret, Hk)
+    cf  = zeros(Float64, Nsys)
+    Ret = zeros(Float64, Nsys)
+    Hk  = zeros(Float64, Nsys)
+
+    for is in 1:3                       # 1=lower, 2=upper, 3=wake
+        Is = M.vsol.Is[is]
+        param = build_param(M, is)
+        for j in Is
+            param = station_param(M, param, j)
+            Uj = @view M.glob.U[:, j]
+
+            uk, _     = get_uk(Uj[4], param)     # corrected edge speed
+            cfloc, _  = get_cf(Uj, param)        # local skin-friction coeff (edge-based)
+            Retj, _   = get_Ret(Uj, param)       # Re_θ
+            Hkj, _    = get_Hk(Uj, param)        # kinematic shape factor
+
+            # convert to freestream-based cf
+            cf[j]  = cfloc * (uk / param.Vinf)^2
+            Ret[j] = Retj
+            Hk[j]  = Hkj
+        end
+    end
+
+    M.post.cf  = cf
+    M.post.Ret = Ret
+    M.post.Hk  = Hk
+
+    return nothing
+end
+
 
 function solve_viscous!(M) 
 
@@ -3530,12 +3626,32 @@ function solve_viscous!(M)
     build_wake!(M)
 end
 
-M = init_M(2)
+using MAT
+function update_MATLAB!(M)
+    vars = matread("scripts/InitGeom.mat")
+    M.foil.N = vars["Np"]
+    M.foil.x = vars["xp"]
+    M.foil.s = vec(vars["sp"])
+    M.foil.t = vars["tp"]
+    M.wake.N = vars["Nw"]
+    M.wake.x = vars["xw"]
+    M.wake.s = vec(vars["sw"])
+    M.wake.t = vars["tw"]
+    M.isol.uewi = vec(vars["uewi"])
+    M.isol.uewiref = vars["uewiref"]
+    return nothing
+    
+end
+
+M = init_M(5)
+
+update_MATLAB!(M)
+
 enforce_CW_and_TE!(M)
 solve_inviscid!(M)
 M.oper.viscous = true
 init_thermo!(M)
-build_wake!(M)
+#build_wake!(M)
 stagpoint_find!(M)
 identify_surfaces!(M)
 set_wake_gap!(M)
@@ -3544,3 +3660,55 @@ init_boundary_layer!(M)
 stagpoint_move!(M)
 solve_coupled!(M)
 calc_force!(M)
+get_distributions!(M)
+
+
+
+
+using Plots
+
+plt = plot(aspect_ratio=:equal, legend=false, xlabel="x", ylabel="y")
+
+# gather geometry & states
+xy = hcat(M.foil.x, M.wake.x)          # 2×(N+Nw)
+t  = hcat(M.foil.t, M.wake.t)          # 2×(N+Nw)
+N  = M.foil.N
+Nw = M.wake.N
+ds = M.post.ds                         # length N+Nw
+
+# outward unit normals from tangents
+n = hcat(-t[2, :],t[1, :])
+n .= n ./ sqrt.(sum(n.^2, dims=1))     # normalize by column
+
+# split factors at TE for wake envelopes
+rl, ru = 0.0, 1.0
+if Nw > 0
+    rl = 0.5 * (1 + (ds[1] - ds[N]) / ds[N+1])
+    ru = 1 - rl
+end
+
+plot!(xy[1,:], xz[2,:],c=:black)
+
+
+
+# full δ* envelope along lower/upper
+xyd_full = xy .+ n' .* reshape(ds, 1, :)
+colors = Dict(1=>:red, 2=>:blue, 3=>:black)
+
+for is in 1:2
+    Is = M.vsol.Is[is]
+    plot!(xyd_full[1, Is], xyd_full[2, Is]; color=colors[is], linewidth=2)
+end
+
+# wake: draw both edges if present
+if Nw > 0
+    Isw = M.vsol.Is[3]
+    # upper wake edge (+ru)
+    xyd = xy .+ n' .* reshape(ds .* ru, 1, :)
+    plot!(xyd[1, Isw], xyd[2, Isw]; color=colors[3], linewidth=2)
+    # lower wake edge (−rl)
+    xyd = xy .- n' .* reshape(ds .* rl, 1, :)
+    plot!(plt, xyd[1, Isw], xyd[2, Isw]; color=colors[3], linewidth=2)
+end
+
+display(plt)
