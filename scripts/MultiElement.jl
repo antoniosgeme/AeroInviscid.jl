@@ -14,12 +14,12 @@ ip = InviscidProblem(me,0)
 
 sol = solve(ip)
 
-p1 = plot(sol, title="Pressure Coefficient Distribution", xlabel=L"x", ylabel=L"C_p")
-xlims!( -1, 2.6)
+p1 = plot(sol, title="Pressure Coefficient Distribution", xlabel=L"x", ylabel=L"C_p",frame=:box)
+xlims!( -0.1, 1.5)
 ylims!(-15, 3)
 
 p2 = flowplot(sol, title="Flow Field around Multielement Airfoil", xlabel=L"x", ylabel=L"y")
 
-p3 = plot(p1,p2, layout=(2,1), size=(800,1000),dpi=300)
+p3 = plot(p1,p2, layout=(1,2), size=(1200,400),dpi=300,margin=5Plots.mm)
 
-savefig(p3, "multielement_airfoil_solution.png")
+savefig(p3, "assets/multielement_airfoil_solution.png")
