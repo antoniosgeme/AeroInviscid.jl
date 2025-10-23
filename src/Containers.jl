@@ -2,7 +2,7 @@ abstract type FlowSolution   end
 abstract type FlowSingularity end
 abstract type LinearVortex <: FlowSingularity end
 
-struct InviscidProblem{G<:Geometry,S<:FlowSingularity}
+struct InviscidProblem{G<:AeroComponent,S<:FlowSingularity}
     geometry    :: G
     alpha       :: Float64
 end
@@ -14,19 +14,19 @@ Convenience constructors so you can pass the *type* of the singularity:
     InviscidProblem(geom, LinearVortex, α)
     InviscidProblem(geom, α, LinearVortex)
 """
-InviscidProblem(geom::G, ::Type{S},α) where {G<:Geometry,S<:FlowSingularity} =
+InviscidProblem(geom::G, ::Type{S},α) where {G<:AeroComponent,S<:FlowSingularity} =
     InviscidProblem{G,S}(geom, α)
 
-InviscidProblem(geom::G, α, ::Type{S}) where {G<:Geometry,S<:FlowSingularity} =
+InviscidProblem(geom::G, α, ::Type{S}) where {G<:AeroComponent,S<:FlowSingularity} =
     InviscidProblem{G,S}(geom, α)
 
-InviscidProblem(geom::G,α) where G<:Geometry =
+InviscidProblem(geom::G,α) where G<:AeroComponent =
     InviscidProblem{G,LinearVortex}(geom, α)
 
 # ────────────────────────────────────────────────
 # Solution container 
 # ────────────────────────────────────────────────
-struct InviscidSolution{G<:Geometry,S<:FlowSingularity} <: FlowSolution
+struct InviscidSolution{G<:AeroComponent,S<:FlowSingularity} <: FlowSolution
     geometry    :: G
     alpha       :: Float64
     strength    :: Vector{Float64}
@@ -42,14 +42,14 @@ Small helper so you can write
 """
 InviscidSolution(geom::G, α::Real, ::Type{S},
                  σ::Vector{<:Real}, cp::Vector{<:Real}, cl::Real) where
-                {G<:Geometry,S<:FlowSingularity} =
+                {G<:AeroComponent,S<:FlowSingularity} =
     InviscidSolution{G,S}(geom, α, σ, cp, cl)
 
 
 
-struct MultielementAirfoil <: Geometry
-    airfoils::Vector{Airfoil}
-    pitch::Vector{<:Real}
-    chord::Vector{<:Real}
-    le_loc::Vector{Vector{Real}}
-end 
+struct MultielementAirfoil{T} <: AeroComponent
+    airfoils::Vector{Airfoil{T}}
+    pitch::Vector{T}
+    chord::Vector{T}
+    le_loc::Vector{Vector{T}}
+end

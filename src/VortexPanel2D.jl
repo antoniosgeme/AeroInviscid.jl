@@ -11,7 +11,7 @@ function solve(prob::InviscidProblem{A,LinearVortex}) where A<:Airfoil
     return InviscidSolution(airfoil, α, LinearVortex, γ, cp, cl)
 end
 
-function solve(prob::InviscidProblem{MultielementAirfoil,LinearVortex})
+function solve(prob::InviscidProblem{MultielementAirfoil{T},LinearVortex}) where T
     multielement = prob.geometry
 
     γ  = linear_vortex_solver(multielement, prob.alpha)
@@ -72,7 +72,7 @@ end
 
 
 
-function linear_vortex_solver(multielement::MultielementAirfoil,α::Real)
+function linear_vortex_solver(multielement::MultielementAirfoil{T},α::Real) where T
     airfoils = multielement.airfoils
     pitch = multielement.pitch
     chord = multielement.chord
@@ -196,6 +196,89 @@ end
 
 
 
+"""
+    induced_velocity_vortex_sheet_total(x, y, xᵧ, yᵧ, γ)
+
+Compute the total induced velocity at points (x, y) from a closed vortex sheet
+defined by vertices (xᵧ, yᵧ) with piecewise-linear strength γ, without forming
+Nc×Nv intermediate arrays. This is equivalent to summing the second dimension of
+`induced_velocity_vortex_sheet`, but with drastically reduced allocations.
+"""
+function induced_velocity_vortex_sheet_total(
+    x::AbstractVector{T}, y::AbstractVector{T},
+    xᵧ::AbstractVector{T}, yᵧ::AbstractVector{T},
+    γ::AbstractVector{T},
+) where {T<:Real}
+
+    @assert length(x) == length(y) "x and y must have the same length"
+    @assert length(xᵧ) == length(yᵧ) "xᵧ and yᵧ must have the same length"
+
+    Nv = length(xᵧ)
+    Nc = length(x)
+
+    # Panel orientations and lengths
+    θ = atan.(diff(yᵧ), diff(xᵧ))
+    d = hypot.(diff(xᵧ), diff(yᵧ))
+    cθ = cos.(θ)
+    sθ = sin.(θ)
+
+    # Trailing edge connector (end to start)
+    θ_te = atan(yᵧ[1] - yᵧ[end], xᵧ[1] - xᵧ[end])
+    d_te = hypot(xᵧ[1] - xᵧ[end], yᵧ[1] - yᵧ[end])
+
+    cθ1, sθ1 = cos(θ[1]), sin(θ[1])
+    cθe, sθe = cos(θ[end]), sin(θ[end])
+    bx = cθ1 - cθe
+    by = sθ1 - sθe
+    bnorm = hypot(bx, by)
+    bx /= bnorm 
+    by /= bnorm
+
+    cte, ste = cos(θ_te), sin(θ_te)
+    dot_prod   = abs(cte*bx + ste*by)
+    cross_prod = abs(cte*by - ste*bx) 
+
+    # Output accumulators
+    U = zeros(T, Nc)
+    V = similar(U)
+
+    @inbounds Base.Threads.@threads for i in 1:Nc
+        # TE panel (acts between end and start)
+        dx = x[i] - xᵧ[end]
+        dy = y[i] - yᵧ[end]
+        xp =  cte*dx + ste*dy
+        yp = -ste*dx + cte*dy
+        upₐ, upᵦ, vpₐ, vpᵦ = induced_velocity_te_panel(-γ[end], γ[1], xp, yp, d_te, cross_prod, dot_prod)
+        uα =  cte*upₐ - ste*vpₐ
+        vα =  ste*upₐ + cte*vpₐ
+        uβ =  cte*upᵦ - ste*vpᵦ
+        vβ =  ste*upᵦ + cte*vpᵦ
+        usum = uα + uβ
+        vsum = vα + vβ
+
+        # Regular linear-vortex panels along the sheet
+        for j in 1:Nv-1
+            dxp = x[i] - xᵧ[j]
+            dyp = y[i] - yᵧ[j]
+            c = cθ[j]; s = sθ[j]
+            xp =  c*dxp + s*dyp
+            yp = -s*dxp + c*dyp
+            upₐ, upᵦ, vpₐ, vpᵦ = induced_velocity_linear_vortex(γ[j], γ[j+1], xp, yp, d[j])
+            uα =  c*upₐ - s*vpₐ
+            vα =  s*upₐ + c*vpₐ
+            uβ =  c*upᵦ - s*vpᵦ
+            vβ =  s*upᵦ + c*vpᵦ
+            usum += uα + uβ
+            vsum += vα + vβ
+        end
+
+        U[i] = usum
+        V[i] = vsum
+    end
+
+    return U, V
+end
+
 
 """
     induced_velocity_linear_vortex(γₐ, γᵦ, x, y, d)
@@ -262,20 +345,18 @@ function induced_velocity(
     xpts = vec(X)    
     ypts = vec(Y)
 
-    u_vals, v_vals = induced_velocity_vortex_sheet(
+    # Use allocation-light total variant for field evaluation
+    u, v = induced_velocity_vortex_sheet_total(
         xpts, ypts, x_sheet, y_sheet, γ_sheet)
 
-    u = sum(u_vals,dims=2) .+ cosd(sol.alpha)
-    v = sum(v_vals,dims=2) .+ sind(sol.alpha)
-
-    U = reshape(u, shp)
-    V = reshape(v, shp)
+    U = reshape(u .+ cosd(sol.alpha), shp)
+    V = reshape(v .+ sind(sol.alpha), shp)
 
     return U, V
 end
 
 function induced_velocity(
-    sol::InviscidSolution{MultielementAirfoil,LinearVortex},
+    sol::InviscidSolution{MultielementAirfoil{T},LinearVortex},
     X::AbstractArray{T}, Y::AbstractArray{T},
 ) where T<:Real
 
@@ -301,14 +382,8 @@ function induced_velocity(
         x_sheet = getindex.(xy_vort, 1)
         y_sheet = getindex.(xy_vort, 2)
 
-        u_vals, v_vals = induced_velocity_vortex_sheet(
-            xpts, ypts,
-            x_sheet, y_sheet,
-            γ_sheet
-        )
-
-        u_contrib = vec(sum(u_vals, dims=2))
-        v_contrib = vec(sum(v_vals, dims=2))
+        u_contrib, v_contrib = induced_velocity_vortex_sheet_total(
+            xpts, ypts, x_sheet, y_sheet, γ_sheet)
 
         U .+= reshape(u_contrib, shp)
         V .+= reshape(v_contrib, shp)
@@ -321,9 +396,8 @@ function induced_velocity(
 end
 
 
-function segment_ranges(multielement::MultielementAirfoil)
+function segment_ranges(multielement::MultielementAirfoil{T}) where T
     offset = 1
-    println(offset)
     lengths = [length(airfoil.x) for airfoil in multielement.airfoils]
     ends = offset .+ cumsum(lengths) .- 1
     starts = offset .+ [0; cumsum(lengths[1:end-1])]
