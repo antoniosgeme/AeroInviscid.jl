@@ -2,7 +2,8 @@
 
 Lightweight 2D inviscid aerodynamics in Julia: linear vortex panel method for single and multi-element airfoils, plus plotting recipes for Cp and streamlines.
 
-![Multi-element Airfoil Solution](./assets/multielement_airfoil_solution.png)
+![Multi-element Airfoil Solution](assets/multielement_airfoil_solution.png)
+
 
 ## Features
 
