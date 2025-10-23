@@ -9,20 +9,17 @@ Lightweight 2D inviscid aerodynamics in Julia: linear vortex panel method for si
 ## Features
 
 - Linear vortex-sheet panel solver for `Airfoil` and `MultielementAirfoil`
+- Access to NACA 4-digit and 5-digit airfoils, entire UIUC airfoil database, and custom geometries via local `.dat` files
 - Built-in plot recipes:
 	- `plot(sol)` for pressure coefficient (Cp) distribution on the geometry
 	- `flowplot(sol; ...)` for flow field visualization with streamlines
-- Programmatic field evaluation with `induced_velocity(sol, X, Y)`
-- Support for keyword arguments: `InviscidProblem(geom; alpha=α)`
-- Multi-threaded velocity field computation for performance
-- Comprehensive test suite validating against analytical solutions
+- Velocity field evaluation with `induced_velocity(sol, X, Y)`
 
 ## Quick start
 
 ### Single airfoil
 
 ```julia
-using AeroGeometry
 using AeroInviscid
 using Plots
 
@@ -41,7 +38,6 @@ flowplot(sol; xlims=(-1, 2), ylims=(-1, 1),
 ### Multi-element airfoil
 
 ```julia
-using AeroGeometry
 using AeroInviscid
 using Plots
 using LaTeXStrings
@@ -55,12 +51,13 @@ me = MultielementAirfoil(airfoils, pitch, chord, le_loc)
 prob = InviscidProblem(me, alpha=0.0)
 sol = solve(prob)
 
-p1 = plot(sol, title="Pressure Coefficient Distribution", xlabel=L"x", ylabel=L"C_p")
-xlims!(p1, -1, 2.6); ylims!(p1, -15, 3)
+p1 = plot(sol, title="Pressure Coefficient Distribution", xlabel=L"x", ylabel=L"C_p",frame=:box)
+xlims!( -0.1, 1.5)
+ylims!(-15, 3)
 
 p2 = flowplot(sol, title="Flow Field around Multielement Airfoil", xlabel=L"x", ylabel=L"y")
 
-plot(p1, p2, layout=(2,1), size=(800, 1000))
+p3 = plot(p1,p2, layout=(1,2), size=(1200,400),dpi=300,margin=5Plots.mm)
+
 ```
 
-The file `scripts/MultiElement.jl` contains a full, runnable example that generates the image shown above.

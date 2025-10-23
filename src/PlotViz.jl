@@ -67,6 +67,7 @@ end
         offset += Nv
     end 
 end
+
 @userplot FlowPlot
 
 @recipe function f(fp::FlowPlot;
