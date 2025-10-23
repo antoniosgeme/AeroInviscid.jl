@@ -1,7 +1,8 @@
 module AeroInviscid
 
 using LinearAlgebra
-using AeroGeometry
+using Reexport
+@reexport using AeroGeometry
 
 export InviscidProblem, solve, LinearVortex, MultielementAirfoil, 
 induced_velocity, streamlines, element_coordinates, shift_scale_rotate, 

@@ -13,15 +13,24 @@ Convenience constructors so you can pass the *type* of the singularity:
     InviscidProblem(geom, LinearVortex)
     InviscidProblem(geom, LinearVortex, α)
     InviscidProblem(geom, α, LinearVortex)
+    InviscidProblem(geom; alpha=α)
+    InviscidProblem(geom, LinearVortex; alpha=α)
 """
-InviscidProblem(geom::G, ::Type{S},α) where {G<:AeroComponent,S<:FlowSingularity} =
+InviscidProblem(geom::G, ::Type{S}, α) where {G<:AeroComponent,S<:FlowSingularity} =
     InviscidProblem{G,S}(geom, α)
 
 InviscidProblem(geom::G, α, ::Type{S}) where {G<:AeroComponent,S<:FlowSingularity} =
     InviscidProblem{G,S}(geom, α)
 
-InviscidProblem(geom::G,α) where G<:AeroComponent =
+InviscidProblem(geom::G, α) where G<:AeroComponent =
     InviscidProblem{G,LinearVortex}(geom, α)
+
+# Keyword argument constructors
+InviscidProblem(geom::G; alpha::Real) where G<:AeroComponent =
+    InviscidProblem{G,LinearVortex}(geom, alpha)
+
+InviscidProblem(geom::G, ::Type{S}; alpha::Real) where {G<:AeroComponent,S<:FlowSingularity} =
+    InviscidProblem{G,S}(geom, alpha)
 
 # ────────────────────────────────────────────────
 # Solution container 

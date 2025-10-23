@@ -1,4 +1,3 @@
-using AeroGeometry
 using AeroInviscid
 using Plots
 using LaTeXStrings
@@ -21,5 +20,6 @@ ylims!(-15, 3)
 
 p2 = flowplot(sol, title="Flow Field around Multielement Airfoil", xlabel=L"x", ylabel=L"y")
 
-p3 = plot(p1,p2, layout=(2,1), size=(800,1000))
+p3 = plot(p1,p2, layout=(2,1), size=(800,1000),dpi=300)
 
+savefig(p3, "multielement_airfoil_solution.png")
