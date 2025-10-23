@@ -17,6 +17,12 @@ Lightweight 2D inviscid aerodynamics in Julia: linear vortex panel method for si
 
 ## Quick start
 
+# Installation
+
+```julia
+]add "https://github.com/antoniosgeme/AeroInviscid.jl.git"
+```
+
 ### Single airfoil
 
 ```julia
