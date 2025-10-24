@@ -54,6 +54,7 @@ function linear_vortex_solver(airfoil::Airfoil,α::T) where T<:Real
 
     RHS = Vector{T}(undef,Nv)
     RHS[1:end-1] = -( cosd(α) .* n̂[:,1] +  sind(α)  .* n̂[:,2])
+    RHS[end] = 0
 
     if trailing_edge_thickness(airfoil) < 1e-4
         A[end-1,:] .= 0
