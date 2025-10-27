@@ -3,8 +3,8 @@ using RecipesBase
 using PlotUtils
 using PrettyStreamlines
 
-@recipe function f(sol::InviscidSolution{A,S};
-    ) where {A<:Airfoil,S<:LinearVortex}
+@recipe function f(sol::InviscidSolution{A,S,T};
+    ) where {A<:Airfoil,S<:LinearVortex,T}
 
     af   = sol.geometry
     x    = af.x; 
@@ -30,8 +30,8 @@ using PrettyStreamlines
 end
 
 
-@recipe function f(sol::InviscidSolution{M,S};
-    ) where {M<:MultielementAirfoil{T},S<:LinearVortex} where T
+@recipe function f(sol::InviscidSolution{M,S,U};
+    ) where {T,M<:MultielementAirfoil{T},S<:LinearVortex,U}
 
     multielement   = sol.geometry
     le_loc = multielement.le_loc

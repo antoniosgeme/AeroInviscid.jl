@@ -1,4 +1,4 @@
-function solve(prob::InviscidProblem{A,LinearVortex}) where A<:Airfoil
+function solve(prob::InviscidProblem{A,LinearVortex,T}) where {A<:Airfoil,T}
     airfoil = prob.geometry
     α       = prob.alpha
 
@@ -11,13 +11,13 @@ function solve(prob::InviscidProblem{A,LinearVortex}) where A<:Airfoil
     return InviscidSolution(airfoil, α, LinearVortex, γ, cp, cl)
 end
 
-function solve(prob::InviscidProblem{MultielementAirfoil{T},LinearVortex}) where T
+function solve(prob::InviscidProblem{MultielementAirfoil{S},LinearVortex,T}) where {S,T}
     multielement = prob.geometry
 
     γ  = linear_vortex_solver(multielement, prob.alpha)
     cp = @. 1 - γ^2   
 
-    cl = 0.0
+    cl = zero(T)
     offset = 1
     for airfoil in multielement.airfoils
         Nv = length(airfoil.x)
@@ -35,7 +35,10 @@ function solve(prob::InviscidProblem{MultielementAirfoil{T},LinearVortex}) where
 end
 
 
-function linear_vortex_solver(airfoil::Airfoil,α::T) where T<:Real
+function linear_vortex_solver(airfoil::Airfoil{S},α::T) where {S,T<:Real}
+    # Promote to common type for AD compatibility
+    U = promote_type(S, T)
+    
     xᵥ = airfoil.x
     yᵥ = airfoil.y
     xc = ( xᵥ[1:end-1] + xᵥ[2:end]) / 2
@@ -45,15 +48,16 @@ function linear_vortex_solver(airfoil::Airfoil,α::T) where T<:Real
 
     θ = atan.( diff(yᵥ) , diff(xᵥ) )
     n̂ = [sin.(θ) -cos.(θ)] 
-    uᵧ,vᵧ = induced_velocity_vortex_sheet(xc, yc, xᵥ, yᵥ, ones(size(xᵥ)))
+    uᵧ,vᵧ = induced_velocity_vortex_sheet(xc, yc, xᵥ, yᵥ, ones(S, size(xᵥ)))
 
-    A = zeros(Nc+1,Nv)
+    A = zeros(U, Nc+1,Nv)
     A[1:end-1,:] = uᵧ .* n̂[:,1] + vᵧ .* n̂[:,2]
     A[Nc+1,1] = 1
     A[Nc+1,Nv] = 1 
 
-    RHS = Vector{T}(undef,Nv)
-    RHS[1:end-1] = -( cosd(α) .* n̂[:,1] +  sind(α)  .* n̂[:,2])
+    α_rad = deg2rad(α)
+    RHS = Vector{U}(undef,Nv)
+    RHS[1:end-1] = -( cos(α_rad) .* n̂[:,1] +  sin(α_rad)  .* n̂[:,2])
     RHS[end] = 0
 
     if trailing_edge_thickness(airfoil) < 1e-4
@@ -73,7 +77,7 @@ end
 
 
 
-function linear_vortex_solver(multielement::MultielementAirfoil{T},α::Real) where T
+function linear_vortex_solver(multielement::MultielementAirfoil{T},α::S) where {T,S<:Real}
     airfoils = multielement.airfoils
     pitch = multielement.pitch
     chord = multielement.chord
@@ -81,12 +85,16 @@ function linear_vortex_solver(multielement::MultielementAirfoil{T},α::Real) whe
     num_airfoils = length(multielement.airfoils)
     num_vort = sum([length(airfoil.x) for airfoil in airfoils]) 
     num_col = num_vort-num_airfoils
-    x_col = zeros(num_col)
-    y_col = zeros(num_col)
-    x_vort = zeros(num_vort)
-    y_vort = zeros(num_vort)
-    d = zeros(num_col)
-    θ = zeros(num_col)
+    
+    # Promote to common type for AD compatibility
+    U = promote_type(T, S)
+    
+    x_col = zeros(U, num_col)
+    y_col = zeros(U, num_col)
+    x_vort = zeros(U, num_vort)
+    y_vort = zeros(U, num_vort)
+    d = zeros(U, num_col)
+    θ = zeros(U, num_col)
     array_size = [length(airfoil.x) for airfoil in airfoils]
     start_vort_idx = cumsum(array_size)-array_size.+1
     end_vort_idx = start_vort_idx + array_size .- 1
@@ -110,21 +118,21 @@ function linear_vortex_solver(multielement::MultielementAirfoil{T},α::Real) whe
     end 
 
     n_hat = [sin.(θ) -cos.(θ)] 
-    A = zeros(num_vort,num_vort) 
+    A = zeros(U, num_vort,num_vort) 
     for i = 1:num_airfoils # Vortex
         v1 = start_vort_idx[i]
         v2 = end_vort_idx[i]
         for j = 1:num_airfoils # Collocation
             c1 = start_col_idx[j]
             c2 = end_col_idx[j]
-            u,v = induced_velocity_vortex_sheet(x_col[c1:c2],y_col[c1:c2],x_vort[v1:v2],y_vort[v1:v2],ones(length(v1:v2)))
+            u,v = induced_velocity_vortex_sheet(x_col[c1:c2],y_col[c1:c2],x_vort[v1:v2],y_vort[v1:v2],ones(U, length(v1:v2)))
             A[c1:c2,v1:v2] = A[c1:c2,v1:v2] + u .* n_hat[c1:c2,1] + v .* n_hat[c1:c2,2]
         end 
         A[end-num_airfoils+i,start_vort_idx[i]] = 1
         A[end-num_airfoils+i,end_vort_idx[i]] = 1
     end 
     
-    RHS = zeros(num_vort)
+    RHS = zeros(U, num_vort)
     RHS[start_col_idx[1]:end_col_idx[end]] = - n_hat[start_col_idx[1]:end_col_idx[end],1] 
 
     for i = 1:num_airfoils
@@ -167,12 +175,12 @@ function induced_velocity_vortex_sheet(x,y,xᵧ::AbstractVector{T}, yᵧ::Abstra
     b_te = (t_hat[1,:] - t_hat[end,:]) / norm( t_hat[1,:]-t_hat[end,:])
     dot_prod = abs(t_te[1]*b_te[1] + t_te[2]*b_te[2])
     cross_prod = abs(t_te[1]*b_te[2] - t_te[2]*b_te[1])
-    uₐ = zeros(Nc,Nv)
-    vₐ = zeros(Nc,Nv)
-    uᵦ = zeros(Nc,Nv)
-    vᵦ = zeros(Nc,Nv)
-    u = zeros(Nc,Nv)
-    v = zeros(Nc,Nv)
+    uₐ = zeros(T, Nc,Nv)
+    vₐ = zeros(T, Nc,Nv)
+    uᵦ = zeros(T, Nc,Nv)
+    vᵦ = zeros(T, Nc,Nv)
+    u = zeros(T, Nc,Nv)
+    v = zeros(T, Nc,Nv)
     for i = 1:Nc
         for j = 1:Nv-1
             (xp, yp) = panel_coordinates(x[i], y[i], xᵧ[j], yᵧ[j], θ[j])
@@ -334,9 +342,9 @@ function induced_velocity(
 end
 
 function induced_velocity(
-    sol::InviscidSolution{A,LinearVortex},
+    sol::InviscidSolution{A,LinearVortex,S},
     X::AbstractArray{T}, Y::AbstractArray{T},
-) where {A<:Airfoil,T<:Real}
+) where {A<:Airfoil,S,T<:Real}
     
     shp = size(X)
 
@@ -350,20 +358,21 @@ function induced_velocity(
     u, v = induced_velocity_vortex_sheet_total(
         xpts, ypts, x_sheet, y_sheet, γ_sheet)
 
-    U = reshape(u .+ cosd(sol.alpha), shp)
-    V = reshape(v .+ sind(sol.alpha), shp)
+    α_rad = deg2rad(sol.alpha)
+    U = reshape(u .+ cos(α_rad), shp)
+    V = reshape(v .+ sin(α_rad), shp)
 
     return U, V
 end
 
 function induced_velocity(
-    sol::InviscidSolution{MultielementAirfoil{T},LinearVortex},
+    sol::InviscidSolution{MultielementAirfoil{T},LinearVortex,S},
     X::AbstractArray{T}, Y::AbstractArray{T},
-) where T<:Real
+) where {T<:Real,S}
 
     shp = size(X)
-    U = zeros(Float64, shp)
-    V = zeros(Float64, shp)
+    U = zeros(T, shp)
+    V = zeros(T, shp)
 
     # flatten grid
     xpts = vec(X)
@@ -390,8 +399,9 @@ function induced_velocity(
         V .+= reshape(v_contrib, shp)
     end
 
-    U .+= cosd(sol.alpha)
-    V .+= sind(sol.alpha)
+    α_rad = deg2rad(sol.alpha)
+    U .+= cos(α_rad)
+    V .+= sin(α_rad)
 
     return U, V
 end

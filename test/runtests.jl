@@ -5,4 +5,5 @@ using LinearAlgebra
 
 @testset "AeroInviscid.jl Tests" begin
     include("test_joukowski.jl")
+    include("test_autodiff.jl")
 end
