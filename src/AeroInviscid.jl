@@ -14,6 +14,8 @@ include("Tools.jl")
 
 include("VortexPanel2D.jl")
 
+include("VortexLattice.jl")
+
 include("PlotViz.jl")
 
 

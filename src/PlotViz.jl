@@ -168,3 +168,30 @@ end
     end
 
 end
+
+
+@recipe function f(me::MultielementAirfoil{T}) where {T}
+
+    # Plot aesthetics
+    aspect_ratio := :equal
+    xlabel       := "x"
+    ylabel       := "y"
+    frame        := :box
+    grid         := true
+    bg           := :black
+    geometry_color = :white
+
+    # Draw geometry shapes first
+    
+    for coords in element_coordinates(me)
+        xt = view(coords, :, 1)
+        yt = view(coords, :, 2)
+        @series begin
+            seriestype   := :shape
+            fillcolor    := geometry_color
+            linecolor    := geometry_color
+            label        := nothing
+            (xt, yt)
+        end
+    end
+end
